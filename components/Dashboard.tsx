@@ -14,6 +14,8 @@ type AccountPayload = {
     currency: string | null;
   };
   openPositionCount: number;
+  positions?: Position[];
+  accessPoint?: string | null;
   fetchedAt: string;
 };
 
@@ -63,15 +65,17 @@ type Strategy = {
 
 type TickResponse = {
   state: Strategy;
-  action: "noop" | "open" | "close" | "skipped" | "error";
+  action: "noop" | "open" | "close" | "skipped" | "error" | "rate_limited";
   detail?: string;
   reason?: "sl" | "tp" | "timeout";
+  retryAfterSec?: number;
+  accessPoint?: string | null;
 };
 
 type RobotLogEntry = {
   id: string;
   at: string;
-  level: "info" | "ok" | "error";
+  level: "info" | "ok" | "warn" | "error";
   text: string;
 };
 
@@ -85,6 +89,11 @@ type PersistedRobot = {
 
 const TICK_BASE_MS = 35_000;
 const TICK_MAX_MS = 60_000;
+const RATE_LIMIT_MIN_MS = 60_000;
+const RATE_LIMIT_MAX_MS = 300_000;
+const REFRESH_MS = 20_000;
+const AP_KEY = "exness-ap-v1";
+const AP_MAX_AGE_MS = 25 * 60_000;
 const LOG_MAX = 100;
 const STORAGE_KEY = "exness-robot-v1";
 
@@ -141,6 +150,11 @@ function describeTick(r: TickResponse): { level: RobotLogEntry["level"]; text: s
       };
     case "noop":
       return { level: "info", text: r.detail ?? "sin cambios" };
+    case "rate_limited":
+      return {
+        level: "warn",
+        text: `Rate limit de Exness, reintentando en ${r.retryAfterSec ?? 60}s`,
+      };
     case "skipped":
       return { level: "info", text: `tick omitido (${r.detail ?? "—"})` };
     case "error":
@@ -181,14 +195,48 @@ function statusLabel(s: Strategy | null): string {
   return "flat";
 }
 
+function readAccessPoint(): string | null {
+  try {
+    const raw = window.localStorage.getItem(AP_KEY);
+    if (!raw) return null;
+    const j = JSON.parse(raw) as { url?: string; at?: number };
+    if (!j.url || !j.at || Date.now() - j.at > AP_MAX_AGE_MS) return null;
+    return j.url;
+  } catch {
+    return null;
+  }
+}
+
+function rememberAccessPoint(url: string | null | undefined) {
+  if (!url) return;
+  try {
+    const raw = window.localStorage.getItem(AP_KEY);
+    const j = raw ? (JSON.parse(raw) as { url?: string; at?: number }) : {};
+    // keep the original timestamp while the access point is unchanged
+    const at = j.url === url && j.at ? j.at : Date.now();
+    window.localStorage.setItem(AP_KEY, JSON.stringify({ url, at }));
+  } catch {
+    /* ignore */
+  }
+}
+
+type ApiFail = {
+  ok: false;
+  status: number;
+  error: string;
+  retryAfterSec?: number;
+};
+
 async function api<T>(
   path: string,
   init?: RequestInit,
-): Promise<{ ok: true; data: T } | { ok: false; status: number; error: string }> {
+): Promise<{ ok: true; data: T } | ApiFail> {
+  const ap = readAccessPoint();
   const res = await fetch(path, {
     ...init,
     headers: {
       "Content-Type": "application/json",
+      ...(ap ? { "x-exn-ap": ap } : {}),
       ...(init?.headers || {}),
     },
   });
@@ -197,12 +245,17 @@ async function api<T>(
     return { ok: false, status: 401, error: "No autorizado" };
   }
   if (!res.ok) {
+    const j = json as { error?: string; retryAfterSec?: number };
+    const header = Number(res.headers.get("retry-after"));
     return {
       ok: false,
       status: res.status,
-      error: (json as { error?: string }).error || `HTTP ${res.status}`,
+      error: j.error || `HTTP ${res.status}`,
+      retryAfterSec:
+        j.retryAfterSec ?? (Number.isFinite(header) && header > 0 ? header : undefined),
     };
   }
+  rememberAccessPoint((json as { accessPoint?: string | null }).accessPoint);
   return { ok: true, data: json as T };
 }
 
@@ -230,7 +283,7 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
   const [tpUsd, setTpUsd] = useState(0);
   const [secret, setSecret] = useState("");
   const [authed, setAuthed] = useState(!needsAuth);
-  const [tickHealth, setTickHealth] = useState<"ok" | "backoff" | "idle">(
+  const [tickHealth, setTickHealth] = useState<"ok" | "backoff" | "ratelimit" | "idle">(
     "idle",
   );
   const tickLock = useRef(false);
@@ -241,9 +294,8 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const refresh = useCallback(async () => {
-    const [a, p, m] = await Promise.all([
+    const [a, m] = await Promise.all([
       api<AccountPayload>("/api/account"),
-      api<{ positions: Position[] }>("/api/positions"),
       api<{ movements: Movement[] }>("/api/movements"),
     ]);
     if (!a.ok) {
@@ -251,19 +303,23 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
         setAuthed(false);
         return;
       }
-      setError(a.error);
+      setError(
+        a.status === 429
+          ? "Rate limit de Exness (429), reintentando en el próximo refresco…"
+          : a.error,
+      );
     } else {
       setAccount(a.data);
+      if (a.data.positions) setPositions(a.data.positions);
       setError(null);
     }
-    if (p.ok) setPositions(p.data.positions);
     if (m.ok) setMovements(m.data.movements);
   }, []);
 
   useEffect(() => {
     if (!authed) return;
     void refresh();
-    const id = setInterval(() => void refresh(), 8_000);
+    const id = setInterval(() => void refresh(), REFRESH_MS);
     return () => clearInterval(id);
   }, [authed, refresh]);
 
@@ -347,6 +403,7 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
 
     let cancelled = false;
     let consecutiveFailures = 0;
+    let consecutiveRateLimits = 0;
 
     const clearTimer = () => {
       if (timerRef.current) {
@@ -367,6 +424,15 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
       Math.min(
         TICK_MAX_MS,
         Math.round(TICK_BASE_MS * Math.pow(1.4, consecutiveFailures)),
+      );
+
+    const rateLimitDelay = (retryAfterSec?: number) =>
+      Math.min(
+        RATE_LIMIT_MAX_MS,
+        Math.max(
+          RATE_LIMIT_MIN_MS * 2 ** Math.max(0, consecutiveRateLimits - 1),
+          (retryAfterSec ?? 0) * 1000,
+        ),
       );
 
     const runTick = async () => {
@@ -395,19 +461,36 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
           });
           const d = describeTick(r);
           pushLog(d.level, d.text);
-          if (r.action === "error") {
+          if (r.action === "rate_limited") {
+            consecutiveRateLimits += 1;
+            delay = rateLimitDelay(r.retryAfterSec);
+            setTickHealth("ratelimit");
+          } else if (r.action === "error") {
             consecutiveFailures += 1;
             delay = failDelay();
             setTickHealth("backoff");
           } else {
             consecutiveFailures = 0;
+            consecutiveRateLimits = 0;
             setTickHealth("ok");
           }
+        } else if (res.status === 401) {
+          setAuthed(false);
+          return;
+        } else if (res.status === 429) {
+          consecutiveRateLimits += 1;
+          delay = rateLimitDelay(res.retryAfterSec);
+          commitStrategy({
+            ...strategyRef.current,
+            lastTickAt: nowIso,
+            lastAction: "rate_limit",
+          });
+          pushLog(
+            "warn",
+            `Rate limit de Exness (429), reintentando en ${Math.round(delay / 1000)}s`,
+          );
+          setTickHealth("ratelimit");
         } else {
-          if (res.status === 401) {
-            setAuthed(false);
-            return;
-          }
           commitStrategy({
             ...strategyRef.current,
             lastTickAt: nowIso,
@@ -420,7 +503,7 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
           delay = failDelay();
           setTickHealth("backoff");
         }
-        await refresh();
+        if (!cancelled) await refresh();
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         commitStrategy({
@@ -861,9 +944,11 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
                 <strong>{running ? "CORRIENDO" : "DETENIDO"}</strong>
                 <span className="robot-state-sub">
                   {running
-                    ? tickHealth === "backoff"
-                      ? "reintentando tras error"
-                      : "activo mientras esta pestaña esté abierta"
+                    ? tickHealth === "ratelimit"
+                      ? "rate limit, reintentando"
+                      : tickHealth === "backoff"
+                        ? "reintentando tras error"
+                        : "activo mientras esta pestaña esté abierta"
                     : "pulsa Start robot para iniciar"}
                 </span>
               </div>
@@ -920,9 +1005,11 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
                 poll:{" "}
                 {tickHealth === "ok"
                   ? "~35s"
-                  : tickHealth === "backoff"
-                    ? "backoff"
-                    : "idle"}
+                  : tickHealth === "ratelimit"
+                    ? "rate limit (429)"
+                    : tickHealth === "backoff"
+                      ? "backoff"
+                      : "idle"}
               </span>
             </div>
           </>

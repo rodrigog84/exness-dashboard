@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { isAuthenticated, unauthorized } from "@/lib/auth";
-import { getClient, jsonError, loadSettings } from "@/lib/api";
+import { getClient, jsonError, loadSettings, mapPositions } from "@/lib/api";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -9,7 +9,7 @@ export async function GET(req: NextRequest) {
   if (!(await isAuthenticated(req))) return unauthorized();
   try {
     const settings = loadSettings();
-    const client = getClient();
+    const client = getClient(req);
     await client.discoverAccessPoint();
     const [account, snapshot] = await Promise.all([
       client.getAccount(),
@@ -35,6 +35,8 @@ export async function GET(req: NextRequest) {
         raw: state,
       },
       openPositionCount: positions.length,
+      positions: mapPositions(client, snapshot),
+      accessPoint: client.knownAccessPoint(),
       fetchedAt: new Date().toISOString(),
     });
   } catch (err) {

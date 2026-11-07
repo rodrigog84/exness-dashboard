@@ -13,6 +13,7 @@
  */
 
 import {
+  ExnessApiError,
   ExnessTraderClient,
   positionId,
   type Settings,
@@ -267,9 +268,10 @@ export function updateStrategy(patch: StrategyPatch): StrategyConfig {
 
 export type TickResult = {
   state: StrategyConfig;
-  action: "noop" | "open" | "close" | "skipped" | "error";
+  action: "noop" | "open" | "close" | "skipped" | "error" | "rate_limited";
   detail?: string;
   reason?: CloseReason;
+  retryAfterSec?: number;
 };
 
 function numField(obj: Record<string, unknown>, keys: string[]): number | null {
@@ -524,7 +526,7 @@ export async function runStrategyTick(
           }
         }
         if (openedId) break;
-        await new Promise((r) => setTimeout(r, 800));
+        await new Promise((r) => setTimeout(r, 1500));
       }
 
       const openPx = openedPos
@@ -613,9 +615,18 @@ export async function runStrategyTick(
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    s.status = s.managedPositionId ? "in_position" : "flat";
+    if (err instanceof ExnessApiError && err.statusCode === 429) {
+      s.lastAction = "rate_limit";
+      return {
+        state: getStrategyState(),
+        action: "rate_limited",
+        detail: msg,
+        retryAfterSec: err.retryAfterSec ?? 60,
+      };
+    }
     s.lastError = msg;
     s.lastAction = "error";
-    s.status = s.managedPositionId ? "in_position" : "flat";
     pushMovement({
       kind: "error",
       instrument: s.instrument,

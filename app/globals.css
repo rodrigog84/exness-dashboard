@@ -703,3 +703,7 @@ button {
 .robot-log li.log-error span {
   color: var(--danger);
 }
+
+.robot-log li.log-warn span {
+  color: #e8c468;
+}

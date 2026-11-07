@@ -21,8 +21,7 @@ export async function POST(req: NextRequest) {
         { status: 400 },
       );
     }
-    const client = getClient();
-    await client.discoverAccessPoint();
+    const client = getClient(req);
     const ack = await client.closePosition(body.positionId, {
       volume: body.volume,
     });

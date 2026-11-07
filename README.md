@@ -61,6 +61,15 @@ En Vercel **no** hay un proceso forever y **Hobby no permite cron cada minuto**.
 4. **Deja el dashboard abierto** mientras quieras que el robot opere. Si cierras la pestaña, los ticks paran (y se reanudan al reabrir). La UI muestra estado CORRIENDO/DETENIDO, último/próximo tick, última acción, último error y un log del robot.
 5. En **Pro**, puedes reactivar cron minuto en `vercel.json` hacia `GET /api/cron/tick` (auth `CRON_SECRET`) como respaldo.
 
+### Access point y rate limit (429)
+
+El discovery (`/v1/trading/access-point`) tiene rate limit (`AUTH_RATE_LIMIT`). Por eso:
+
+- el access point se cachea en el isolate (TTL 30 min) y el navegador lo guarda en `localStorage` (`exness-ap-v1`) y lo manda en el header `x-exn-ap` (solo se acepta HTTPS bajo el dominio del discovery); un cold start no necesita redescubrir
+- ante un 429 se respeta `Retry-After` o backoff exponencial (60s → 600s) y se reutiliza el último access point conocido
+- el robot no se marca como roto por un 429: muestra "rate limit, reintentando" y reintenta (≥60s)
+- el refresco de la UI es cada 20s y usa un solo snapshot (cuenta + posiciones)
+
 ### Lógica inventable (no optimizada)
 
 Cada tick:

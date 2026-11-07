@@ -26,8 +26,7 @@ export async function GET(req: NextRequest) {
       });
     }
     const settings = loadSettings();
-    const client = getClient();
-    await client.discoverAccessPoint();
+    const client = getClient(req);
     const result = await runStrategyTick(client, settings);
     return NextResponse.json(result);
   } catch (err) {

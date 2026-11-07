@@ -1,7 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { isAuthenticated, unauthorized } from "@/lib/auth";
 import { getClient, jsonError, loadSettings } from "@/lib/api";
-import { hydrateStrategy, runStrategyTick } from "@/lib/strategy";
+import { ExnessApiError } from "@/lib/exness";
+import {
+  getStrategyState,
+  hydrateStrategy,
+  runStrategyTick,
+} from "@/lib/strategy";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -23,10 +28,27 @@ export async function POST(req: NextRequest) {
   try {
     if (body?.strategy) hydrateStrategy(body.strategy);
     const settings = loadSettings();
-    const client = getClient();
-    await client.discoverAccessPoint();
+    const client = getClient(req);
+    try {
+      await client.discoverAccessPoint();
+    } catch (err) {
+      if (err instanceof ExnessApiError && err.statusCode === 429) {
+        const state = getStrategyState();
+        state.lastAction = "rate_limit";
+        return NextResponse.json({
+          state,
+          action: "rate_limited",
+          detail: err.message,
+          retryAfterSec: err.retryAfterSec ?? 60,
+        });
+      }
+      throw err;
+    }
     const result = await runStrategyTick(client, settings);
-    return NextResponse.json(result);
+    return NextResponse.json({
+      ...result,
+      accessPoint: client.knownAccessPoint(),
+    });
   } catch (err) {
     return jsonError(err);
   }

@@ -28,8 +28,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "side inválido" }, { status: 400 });
     }
 
-    const client = getClient();
-    await client.discoverAccessPoint();
+    const client = getClient(req);
     const ack = await client.openPosition({ instrument, side, volume });
     const operationId = String(ack.operation_id ?? "");
     let operation = null;

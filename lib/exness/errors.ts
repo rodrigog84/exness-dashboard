@@ -12,6 +12,8 @@ export class ExnessApiError extends Error {
   errorCode?: string | number | null;
   errorMessage?: string | null;
   body?: unknown;
+  /** Seconds to wait before retrying (from Retry-After or our own backoff). */
+  retryAfterSec?: number;
 
   constructor(
     message: string,
@@ -20,6 +22,7 @@ export class ExnessApiError extends Error {
       errorCode?: string | number | null;
       errorMessage?: string | null;
       body?: unknown;
+      retryAfterSec?: number;
     } = {},
   ) {
     super(message);
@@ -28,5 +31,6 @@ export class ExnessApiError extends Error {
     this.errorCode = opts.errorCode;
     this.errorMessage = opts.errorMessage;
     this.body = opts.body;
+    this.retryAfterSec = opts.retryAfterSec;
   }
 }

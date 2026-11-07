@@ -9,10 +9,41 @@ import { buildSignedHeaders, createIdempotencyKey } from "./signing";
 
 type Json = Record<string, unknown>;
 
+/**
+ * Discovery is rate limited (429 AUTH_RATE_LIMIT), so the access point is
+ * cached for the whole isolate and shared by every client instance / request.
+ */
+const AP_TTL_MS = 30 * 60_000;
+const RL_BASE_SEC = 60;
+const RL_MAX_SEC = 600;
+
+type ApCache = {
+  entries: Record<string, { url: string; at: number }>;
+  blockedUntil: number;
+  strikes: number;
+};
+
+const g = globalThis as unknown as { __exnAp?: ApCache };
+
+function apCache(): ApCache {
+  if (!g.__exnAp) g.__exnAp = { entries: {}, blockedUntil: 0, strikes: 0 };
+  return g.__exnAp;
+}
+
+function parseRetryAfter(h: string | null): number | undefined {
+  if (!h) return undefined;
+  const n = Number(h);
+  if (Number.isFinite(n)) return Math.max(0, Math.ceil(n));
+  const d = Date.parse(h);
+  if (Number.isFinite(d)) return Math.max(0, Math.ceil((d - Date.now()) / 1000));
+  return undefined;
+}
+
 export class ExnessTraderClient {
   settings: Settings;
   private timeoutMs: number;
   private _accessPoint: string | null;
+  private _apAt = 0;
 
   constructor(opts?: {
     settings?: Settings;
@@ -24,29 +55,112 @@ export class ExnessTraderClient {
     this._accessPoint = opts?.accessPoint
       ? normalizeHttpsOrigin(opts.accessPoint)
       : null;
+    if (this._accessPoint) this._apAt = Date.now();
+  }
+
+  /** Last known access point (possibly stale), or null. */
+  knownAccessPoint(): string | null {
+    return (
+      this._accessPoint ??
+      apCache().entries[this.settings.accountId]?.url ??
+      null
+    );
+  }
+
+  /**
+   * Accept an access point remembered by the browser. Only HTTPS hosts under
+   * the discovery host's parent domain are trusted (signed requests go there).
+   * Ignored when we already hold a fresh one.
+   */
+  seedAccessPoint(raw: string | null | undefined): boolean {
+    if (!raw) return false;
+    try {
+      const url = normalizeHttpsOrigin(raw);
+      const host = new URL(url).hostname.toLowerCase();
+      const parent = new URL(this.settings.discoveryBaseUrl).hostname
+        .toLowerCase()
+        .split(".")
+        .slice(-2)
+        .join(".");
+      if (host !== parent && !host.endsWith(`.${parent}`)) return false;
+      const cached = apCache().entries[this.settings.accountId];
+      if (cached && Date.now() - cached.at < AP_TTL_MS) return false;
+      apCache().entries[this.settings.accountId] = { url, at: Date.now() };
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   async discoverAccessPoint(force = false): Promise<string> {
-    if (this._accessPoint && !force) return this._accessPoint;
+    const key = this.settings.accountId;
+    const cache = apCache();
+    const now = Date.now();
+    const cached = cache.entries[key];
+
+    if (!force) {
+      if (this._accessPoint && now - this._apAt < AP_TTL_MS) {
+        return this._accessPoint;
+      }
+      if (cached && now - cached.at < AP_TTL_MS) {
+        this._accessPoint = cached.url;
+        this._apAt = cached.at;
+        return cached.url;
+      }
+    }
+
+    const known = this._accessPoint ?? cached?.url ?? null;
+
+    if (now < cache.blockedUntil) {
+      if (known) return known;
+      throw new ExnessApiError(
+        "Discovery en rate limit (429), esperando antes de reintentar",
+        {
+          statusCode: 429,
+          retryAfterSec: Math.ceil((cache.blockedUntil - now) / 1000),
+        },
+      );
+    }
+
     const path = `/v1/trading/access-point?account_id=${this.settings.accountId}`;
-    const data = await this.requestJson({
-      baseUrl: this.settings.discoveryBaseUrl,
-      method: "GET",
-      pathWithQuery: path,
-    });
+    let data: Json;
+    try {
+      data = await this.requestJson({
+        baseUrl: this.settings.discoveryBaseUrl,
+        method: "GET",
+        pathWithQuery: path,
+      });
+    } catch (err) {
+      if (err instanceof ExnessApiError && err.statusCode === 429) {
+        cache.strikes += 1;
+        const backoff = Math.min(
+          RL_MAX_SEC,
+          RL_BASE_SEC * 2 ** (cache.strikes - 1),
+        );
+        const wait = Math.max(err.retryAfterSec ?? 0, backoff);
+        cache.blockedUntil = Date.now() + wait * 1000;
+        err.retryAfterSec = wait;
+        if (known) return known;
+      }
+      throw err;
+    }
     const value = data.access_point;
     if (typeof value !== "string" || !value) {
       throw new ExnessApiError("Discovery response missing access_point", {
         body: safeBody(data),
       });
     }
-    this._accessPoint = normalizeHttpsOrigin(value);
-    return this._accessPoint;
+    const url = normalizeHttpsOrigin(value);
+    cache.strikes = 0;
+    cache.blockedUntil = 0;
+    cache.entries[key] = { url, at: Date.now() };
+    this._accessPoint = url;
+    this._apAt = Date.now();
+    return url;
   }
 
   async accessPoint(): Promise<string> {
-    if (!this._accessPoint) return this.discoverAccessPoint();
-    return this._accessPoint;
+    return this.discoverAccessPoint();
   }
 
   async getAccount(): Promise<Json> {
@@ -276,6 +390,7 @@ export class ExnessTraderClient {
           errorCode: errCode,
           errorMessage: errMsg,
           body: safeBody(parsed),
+          retryAfterSec: parseRetryAfter(response.headers.get("retry-after")),
         },
       );
     }
