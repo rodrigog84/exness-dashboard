@@ -52,12 +52,13 @@ npm run dev                  # http://localhost:3000
 En Vercel **no** hay un proceso forever y **Hobby no permite cron cada minuto**. El bucle es:
 
 1. En el panel: configura instrumento / volumen / SL / TP → **Start robot**.
-2. Eso hace `POST /api/strategy` con `{ running: true, slPct, tpPct, … }`.
-3. El cliente hace poll fiable a `POST /api/strategy/tick` (~35s) mientras `running`:
-   - tick inmediato al Start y al volver a la pestaña (`visibilitychange` / `focus`)
-   - backoff exponencial si el tick falla (hasta ~120s)
-   - no dispara ticks con la pestaña oculta (reprograma al volver)
-4. **Deja el dashboard abierto** mientras quieras que el robot opere. Si cierras la pestaña, los ticks paran (estado in-memory también puede perderse en cold start).
+2. El **navegador es la fuente de verdad**: guarda el estado del robot (running, config, posición gestionada, log) en `localStorage` y envía el estado completo en cada `POST /api/strategy/tick`. Así un cold start / otra instancia serverless **no** pone `running=false` ni pierde la posición gestionada. Al recargar la pestaña, el robot se reanuda solo.
+3. El cliente hace poll a `POST /api/strategy/tick` (~35s) mientras `running`:
+   - tick inmediato al Start; al volver a la pestaña hace catch-up si pasaron ≥35s
+   - los ticks siguen con la pestaña oculta (el navegador puede ralentizar los timers a ~1/min)
+   - un error de tick (mercado cerrado, SL inválido, red, 5xx) **no detiene** el robot: se registra en el log visible y se reintenta (backoff 35s → 60s)
+   - si un open no se confirma, el siguiente tick adopta la posición nueva en vez de duplicarla
+4. **Deja el dashboard abierto** mientras quieras que el robot opere. Si cierras la pestaña, los ticks paran (y se reanudan al reabrir). La UI muestra estado CORRIENDO/DETENIDO, último/próximo tick, última acción, último error y un log del robot.
 5. En **Pro**, puedes reactivar cron minuto en `vercel.json` hacia `GET /api/cron/tick` (auth `CRON_SECRET`) como respaldo.
 
 ### Lógica inventable (no optimizada)
@@ -71,7 +72,7 @@ Cada tick:
   - **timeout** si `ticksSinceOpen ≥ holdTicks`
 - El log de movimientos marca la razón (`sl` | `tp` | `timeout`).
 
-Estado de estrategia y log: **in-memory** por isolate. Un cold start reinicia `running=false` y vacía el log. Para producción seria: KV / DB.
+El estado de estrategia vive en el navegador (`localStorage`, clave `exness-robot-v1`); el servidor lo recibe en cada tick. Solo el log de *movimientos* del servidor es in-memory por isolate (el log del robot en la UI persiste en el navegador). `GET /api/cron/tick` (Pro) usa la memoria del servidor, por lo que no es fiable sin KV / DB.
 
 ## Auth del dashboard
 

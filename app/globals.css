@@ -592,3 +592,114 @@ button {
     width: 100%;
   }
 }
+
+.robot-state {
+  margin-top: 1.25rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid var(--line);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--ink-dim);
+}
+
+.robot-state.on {
+  border-color: rgba(62, 207, 154, 0.45);
+}
+
+.robot-state-main {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.65rem;
+}
+
+.robot-state-main strong {
+  color: var(--ink);
+  letter-spacing: 0.1em;
+}
+
+.robot-state.on .robot-state-main strong {
+  color: var(--accent);
+}
+
+.robot-dot {
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  background: var(--ink-faint);
+}
+
+.robot-state.on .robot-dot {
+  background: var(--accent);
+  animation: robot-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes robot-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.robot-state-sub {
+  color: var(--ink-faint);
+}
+
+.robot-state-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: 0.4rem 1.5rem;
+}
+
+.robot-state-grid strong {
+  color: var(--ink);
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.robot-state-grid .neg strong {
+  color: var(--danger);
+}
+
+.robot-log {
+  margin-top: 1.25rem;
+}
+
+.robot-log h3 {
+  margin: 0 0 0.5rem;
+  font-size: 0.8rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+}
+
+.robot-log ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 16rem;
+  overflow-y: auto;
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  border: 1px solid var(--line);
+}
+
+.robot-log li {
+  display: grid;
+  grid-template-columns: 5.5rem 1fr;
+  gap: 0.6rem;
+  padding: 0.35rem 0.75rem;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink-dim);
+}
+
+.robot-log li time {
+  color: var(--ink-faint);
+}
+
+.robot-log li.log-ok span {
+  color: var(--accent);
+}
+
+.robot-log li.log-error span {
+  color: var(--danger);
+}

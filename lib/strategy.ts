@@ -6,7 +6,10 @@
  * - Each tick: if flat → open market (alternate / random / fixed side);
  *   if in a managed position → close on SL, optional TP, or max-hold timeout.
  *
- * State is in-memory (module global). Cold starts reset running=false.
+ * The client is the source of truth: it persists the robot state in
+ * localStorage and sends the full state with every tick (hydrateStrategy), so
+ * serverless cold starts / multiple instances never reset `running`.
+ * The module global is only a per-invocation scratchpad.
  */
 
 import {
@@ -47,6 +50,8 @@ export type StrategyConfig = {
   lastCloseReason: CloseReason | null;
   status: RobotStatus;
   tickCount: number;
+  /** Position ids seen before an open order was sent; used to adopt an unconfirmed open instead of duplicating it. */
+  pendingBefore: string[] | null;
 };
 
 type Store = { state: StrategyConfig };
@@ -90,6 +95,7 @@ function defaultState(): StrategyConfig {
     lastCloseReason: null,
     status: "flat",
     tickCount: 0,
+    pendingBefore: null,
   };
 }
 
@@ -126,6 +132,83 @@ function clampPct(n: number): number {
 function clampUsd(n: number): number {
   if (!Number.isFinite(n) || n < 0) return 0;
   return Math.min(1_000_000, n);
+}
+
+function strOrNull(v: unknown): string | null {
+  return typeof v === "string" && v !== "" ? v : null;
+}
+
+function numOrNull(v: unknown): number | null {
+  if (v == null || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Replace server state with the (sanitized) state sent by the client.
+ * Missing / invalid fields fall back to env defaults.
+ */
+export function hydrateStrategy(input: unknown): StrategyConfig {
+  const base = defaultState();
+  if (!input || typeof input !== "object") {
+    store().state = base;
+    return getStrategyState();
+  }
+  const i = input as Record<string, unknown>;
+  const mode = String(i.entryMode ?? "").toLowerCase();
+  const status = String(i.status ?? "");
+  const closeReason = String(i.lastCloseReason ?? "");
+  const managedSide = String(i.managedSide ?? "");
+  const side = String(i.side ?? "");
+  const s: StrategyConfig = {
+    ...base,
+    running: i.running === true,
+    instrument: strOrNull(i.instrument)?.toUpperCase() ?? base.instrument,
+    volume: strOrNull(i.volume) ?? base.volume,
+    side: side === "sell" ? "sell" : side === "buy" ? "buy" : base.side,
+    entryMode:
+      mode === "random" || mode === "fixed" || mode === "alternate"
+        ? mode
+        : base.entryMode,
+    holdTicks:
+      numOrNull(i.holdTicks) != null
+        ? Math.max(1, Math.min(120, Number(i.holdTicks)))
+        : base.holdTicks,
+    slPct: numOrNull(i.slPct) != null ? clampPct(Number(i.slPct)) : base.slPct,
+    slUsd: numOrNull(i.slUsd) != null ? clampUsd(Number(i.slUsd)) : base.slUsd,
+    tpPct: numOrNull(i.tpPct) != null ? clampPct(Number(i.tpPct)) : base.tpPct,
+    tpUsd: numOrNull(i.tpUsd) != null ? clampUsd(Number(i.tpUsd)) : base.tpUsd,
+    ticksSinceOpen: Math.max(0, Math.floor(numOrNull(i.ticksSinceOpen) ?? 0)),
+    managedPositionId: strOrNull(i.managedPositionId),
+    managedSide:
+      managedSide === "buy" || managedSide === "sell" ? managedSide : null,
+    openPrice: numOrNull(i.openPrice),
+    lastTickAt: strOrNull(i.lastTickAt),
+    lastError: strOrNull(i.lastError),
+    lastAction: strOrNull(i.lastAction),
+    lastCloseReason:
+      closeReason === "sl" || closeReason === "tp" || closeReason === "timeout"
+        ? closeReason
+        : null,
+    status:
+      status === "in_position" ||
+      status === "opening" ||
+      status === "closing" ||
+      status === "flat"
+        ? status
+        : "flat",
+    tickCount: Math.max(0, Math.floor(numOrNull(i.tickCount) ?? 0)),
+    pendingBefore: Array.isArray(i.pendingBefore)
+      ? i.pendingBefore.filter((x): x is string => typeof x === "string")
+      : null,
+  };
+  if (!s.managedPositionId) {
+    s.status = "flat";
+  } else {
+    s.status = "in_position";
+  }
+  store().state = s;
+  return getStrategyState();
 }
 
 export function updateStrategy(patch: StrategyPatch): StrategyConfig {
@@ -343,11 +426,47 @@ export async function runStrategyTick(
       }
     }
 
+    if (!s.managedPositionId && s.pendingBefore) {
+      const known = new Set(s.pendingBefore);
+      const adopted = positions.find((p) => {
+        const pid = positionId(p);
+        return (
+          pid &&
+          !known.has(pid) &&
+          String(p.instrument ?? "").toUpperCase() === s.instrument
+        );
+      }) as Record<string, unknown> | undefined;
+      s.pendingBefore = null;
+      if (adopted) {
+        const pid = positionId(adopted)!;
+        const sideRaw = String(adopted.side ?? "").toLowerCase();
+        s.managedPositionId = pid;
+        s.managedSide =
+          sideRaw === "buy" || sideRaw === "sell" ? sideRaw : s.side;
+        s.openPrice = numField(adopted, ["open_price", "price", "avg_price"]);
+        s.ticksSinceOpen = 0;
+        s.status = "in_position";
+        s.lastAction = `adopt:${s.managedSide}`;
+        pushMovement({
+          kind: "info",
+          instrument: s.instrument,
+          positionId: pid,
+          message: `Robot adoptó posición ${pid} (open previo sin confirmar)`,
+          meta: { action: "adopt" },
+        });
+        return { state: getStrategyState(), action: "open", detail: pid };
+      }
+    }
+
     if (!s.managedPositionId) {
       s.status = "opening";
       const entrySide = pickEntrySide(s);
       s.side = entrySide;
       s.lastAction = `opening:${entrySide}`;
+
+      s.pendingBefore = positions
+        .map((p) => positionId(p))
+        .filter(Boolean) as string[];
 
       const ack = await client.openPosition({
         instrument: s.instrument,
@@ -365,6 +484,7 @@ export async function runStrategyTick(
           s.lastError = msg;
           s.status = "flat";
           s.lastAction = "open_error";
+          s.pendingBefore = null;
           pushMovement({
             kind: "error",
             instrument: s.instrument,
@@ -411,6 +531,7 @@ export async function runStrategyTick(
         ? numField(openedPos, ["open_price", "price", "avg_price"])
         : null;
 
+      s.pendingBefore = openedId ? null : s.pendingBefore;
       s.managedPositionId = openedId;
       s.managedSide = entrySide;
       s.openPrice = openPx;
@@ -494,6 +615,7 @@ export async function runStrategyTick(
     const msg = err instanceof Error ? err.message : String(err);
     s.lastError = msg;
     s.lastAction = "error";
+    s.status = s.managedPositionId ? "in_position" : "flat";
     pushMovement({
       kind: "error",
       instrument: s.instrument,

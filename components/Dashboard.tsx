@@ -58,10 +58,95 @@ type Strategy = {
   lastCloseReason: "sl" | "tp" | "timeout" | null;
   status: "flat" | "in_position" | "opening" | "closing";
   tickCount: number;
+  pendingBefore: string[] | null;
+};
+
+type TickResponse = {
+  state: Strategy;
+  action: "noop" | "open" | "close" | "skipped" | "error";
+  detail?: string;
+  reason?: "sl" | "tp" | "timeout";
+};
+
+type RobotLogEntry = {
+  id: string;
+  at: string;
+  level: "info" | "ok" | "error";
+  text: string;
+};
+
+type LastError = { at: string; message: string };
+
+type PersistedRobot = {
+  strategy: Strategy;
+  log: RobotLogEntry[];
+  lastError: LastError | null;
 };
 
 const TICK_BASE_MS = 35_000;
-const TICK_MAX_MS = 120_000;
+const TICK_MAX_MS = 60_000;
+const LOG_MAX = 100;
+const STORAGE_KEY = "exness-robot-v1";
+
+function initialStrategy(): Strategy {
+  return {
+    running: false,
+    instrument: "BTCUSD",
+    volume: "0.01",
+    side: "buy",
+    entryMode: "alternate",
+    holdTicks: 10,
+    slPct: 0.3,
+    slUsd: 0,
+    tpPct: 0,
+    tpUsd: 0,
+    ticksSinceOpen: 0,
+    managedPositionId: null,
+    managedSide: null,
+    openPrice: null,
+    lastTickAt: null,
+    lastError: null,
+    lastAction: null,
+    lastCloseReason: null,
+    status: "flat",
+    tickCount: 0,
+    pendingBefore: null,
+  };
+}
+
+function loadPersisted(): PersistedRobot | null {
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const j = JSON.parse(raw) as Partial<PersistedRobot>;
+    if (!j.strategy || typeof j.strategy !== "object") return null;
+    return {
+      strategy: { ...initialStrategy(), ...j.strategy },
+      log: Array.isArray(j.log) ? j.log.slice(0, LOG_MAX) : [],
+      lastError: j.lastError ?? null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function describeTick(r: TickResponse): { level: RobotLogEntry["level"]; text: string } {
+  switch (r.action) {
+    case "open":
+      return { level: "ok", text: `Abrió/adoptó posición ${r.detail ?? ""}`.trim() };
+    case "close":
+      return {
+        level: "ok",
+        text: `Cerró ${r.detail ?? ""} (${r.reason ?? "?"})`.trim(),
+      };
+    case "noop":
+      return { level: "info", text: r.detail ?? "sin cambios" };
+    case "skipped":
+      return { level: "info", text: `tick omitido (${r.detail ?? "—"})` };
+    case "error":
+      return { level: "error", text: r.detail ?? "error en tick" };
+  }
+}
 
 function fmt(n: string | number | null | undefined, digits = 2): string {
   if (n == null || n === "") return "—";
@@ -126,6 +211,10 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
   const [positions, setPositions] = useState<Position[]>([]);
   const [movements, setMovements] = useState<Movement[]>([]);
   const [strategy, setStrategy] = useState<Strategy | null>(null);
+  const [robotLog, setRobotLog] = useState<RobotLogEntry[]>([]);
+  const [lastError, setLastError] = useState<LastError | null>(null);
+  const [nextTickAt, setNextTickAt] = useState<number | null>(null);
+  const [hydrated, setHydrated] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [instrument, setInstrument] = useState("BTCUSD");
@@ -146,15 +235,16 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
   );
   const tickLock = useRef(false);
   const backoffMs = useRef(TICK_BASE_MS);
-  const runningRef = useRef(false);
+  const strategyRef = useRef<Strategy>(initialStrategy());
+  const logRef = useRef<RobotLogEntry[]>([]);
+  const lastErrorRef = useRef<LastError | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const refresh = useCallback(async () => {
-    const [a, p, m, s] = await Promise.all([
+    const [a, p, m] = await Promise.all([
       api<AccountPayload>("/api/account"),
       api<{ positions: Position[] }>("/api/positions"),
       api<{ movements: Movement[] }>("/api/movements"),
-      api<{ strategy: Strategy }>("/api/strategy"),
     ]);
     if (!a.ok) {
       if (a.status === 401) {
@@ -168,22 +258,6 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
     }
     if (p.ok) setPositions(p.data.positions);
     if (m.ok) setMovements(m.data.movements);
-    if (s.ok) {
-      const st = s.data.strategy;
-      setStrategy(st);
-      runningRef.current = st.running;
-      if (!st.running) {
-        setInstrument(st.instrument || "BTCUSD");
-        setVolume(st.volume || "0.01");
-        setSide(st.side || "buy");
-        setEntryMode(st.entryMode || "alternate");
-        setHoldTicks(st.holdTicks ?? 10);
-        setSlPct(st.slPct ?? 0.3);
-        setSlUsd(st.slUsd ?? 0);
-        setTpPct(st.tpPct ?? 0);
-        setTpUsd(st.tpUsd ?? 0);
-      }
-    }
   }, []);
 
   useEffect(() => {
@@ -193,22 +267,86 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
     return () => clearInterval(id);
   }, [authed, refresh]);
 
-  // Strategy tick poller — UI drives ticks when running (Hobby-safe).
-  // Visibility-aware + exponential backoff on errors.
-  useEffect(() => {
-    if (!authed || !strategy?.running) {
-      runningRef.current = false;
-      setTickHealth("idle");
-      if (timerRef.current) {
-        clearTimeout(timerRef.current);
-        timerRef.current = null;
+  const persist = useCallback(() => {
+    try {
+      const payload: PersistedRobot = {
+        strategy: strategyRef.current,
+        log: logRef.current,
+        lastError: lastErrorRef.current,
+      };
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+    } catch {
+      /* storage unavailable (private mode / quota): robot still runs in memory */
+    }
+  }, []);
+
+  const commitStrategy = useCallback(
+    (st: Strategy) => {
+      strategyRef.current = st;
+      setStrategy(st);
+      persist();
+    },
+    [persist],
+  );
+
+  const pushLog = useCallback(
+    (level: RobotLogEntry["level"], text: string) => {
+      const entry: RobotLogEntry = {
+        id: `l-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        at: new Date().toISOString(),
+        level,
+        text,
+      };
+      logRef.current = [entry, ...logRef.current].slice(0, LOG_MAX);
+      setRobotLog(logRef.current);
+      if (level === "error") {
+        lastErrorRef.current = { at: entry.at, message: text };
+        setLastError(lastErrorRef.current);
       }
+      persist();
+    },
+    [persist],
+  );
+
+  // Restore robot state (running flag, config, managed position, log) after
+  // reload / tab reopen. The browser is the source of truth, not the server.
+  useEffect(() => {
+    const saved = loadPersisted();
+    if (saved) {
+      const st = saved.strategy;
+      strategyRef.current = st;
+      setStrategy(st);
+      logRef.current = saved.log;
+      setRobotLog(saved.log);
+      lastErrorRef.current = saved.lastError;
+      setLastError(saved.lastError);
+      setInstrument(st.instrument);
+      setVolume(st.volume);
+      setSide(st.side);
+      setEntryMode(st.entryMode);
+      setHoldTicks(st.holdTicks);
+      setSlPct(st.slPct);
+      setSlUsd(st.slUsd);
+      setTpPct(st.tpPct);
+      setTpUsd(st.tpUsd);
+    }
+    setHydrated(true);
+  }, []);
+
+  const running = strategy?.running === true;
+
+  // Tick poller. The UI drives ticks (Hobby has no minute cron). Every tick
+  // sends the full robot state, so server cold starts cannot stop the robot,
+  // and tick errors only get logged and retried on the next tick.
+  useEffect(() => {
+    if (!hydrated || !authed || !running) {
+      setTickHealth("idle");
+      setNextTickAt(null);
       return;
     }
 
-    runningRef.current = true;
     let cancelled = false;
-    backoffMs.current = TICK_BASE_MS;
+    let consecutiveFailures = 0;
 
     const clearTimer = () => {
       if (timerRef.current) {
@@ -219,58 +357,108 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
 
     const schedule = (ms: number) => {
       clearTimer();
+      setNextTickAt(Date.now() + ms);
       timerRef.current = setTimeout(() => {
         void runTick();
       }, ms);
     };
 
+    const failDelay = () =>
+      Math.min(
+        TICK_MAX_MS,
+        Math.round(TICK_BASE_MS * Math.pow(1.4, consecutiveFailures)),
+      );
+
     const runTick = async () => {
-      if (cancelled || !runningRef.current) return;
-      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
-        setTickHealth("backoff");
-        schedule(TICK_BASE_MS);
-        return;
-      }
+      if (cancelled || !strategyRef.current.running) return;
       if (tickLock.current) {
         schedule(2_000);
         return;
       }
       tickLock.current = true;
+      setNextTickAt(null);
+      const nowIso = new Date().toISOString();
+      let delay = TICK_BASE_MS;
       try {
-        const res = await api("/api/strategy/tick", { method: "POST" });
-        if (!res.ok) {
-          backoffMs.current = Math.min(
-            TICK_MAX_MS,
-            Math.round(backoffMs.current * 1.6),
-          );
-          setTickHealth("backoff");
-          setError(res.error);
+        const res = await api<TickResponse>("/api/strategy/tick", {
+          method: "POST",
+          body: JSON.stringify({ strategy: strategyRef.current }),
+        });
+        if (cancelled) return;
+        if (res.ok) {
+          const r = res.data;
+          const wasRunning = strategyRef.current.running;
+          commitStrategy({
+            ...r.state,
+            running: wasRunning,
+            lastTickAt: nowIso,
+          });
+          const d = describeTick(r);
+          pushLog(d.level, d.text);
+          if (r.action === "error") {
+            consecutiveFailures += 1;
+            delay = failDelay();
+            setTickHealth("backoff");
+          } else {
+            consecutiveFailures = 0;
+            setTickHealth("ok");
+          }
         } else {
-          backoffMs.current = TICK_BASE_MS;
-          setTickHealth("ok");
+          if (res.status === 401) {
+            setAuthed(false);
+            return;
+          }
+          commitStrategy({
+            ...strategyRef.current,
+            lastTickAt: nowIso,
+            tickCount: strategyRef.current.tickCount + 1,
+            lastAction: "error",
+            lastError: res.error,
+          });
+          pushLog("error", `Tick falló: ${res.error} (reintento automático)`);
+          consecutiveFailures += 1;
+          delay = failDelay();
+          setTickHealth("backoff");
         }
         await refresh();
       } catch (err) {
-        backoffMs.current = Math.min(
-          TICK_MAX_MS,
-          Math.round(backoffMs.current * 1.6),
-        );
+        const msg = err instanceof Error ? err.message : String(err);
+        commitStrategy({
+          ...strategyRef.current,
+          lastTickAt: nowIso,
+          tickCount: strategyRef.current.tickCount + 1,
+          lastAction: "error",
+          lastError: msg,
+        });
+        pushLog("error", `Tick falló: ${msg} (reintento automático)`);
+        consecutiveFailures += 1;
+        delay = failDelay();
         setTickHealth("backoff");
-        setError(err instanceof Error ? err.message : String(err));
       } finally {
         tickLock.current = false;
-        if (!cancelled && runningRef.current) {
-          schedule(backoffMs.current);
-        }
+        if (!cancelled && strategyRef.current.running) schedule(delay);
       }
     };
 
-    // Immediate first tick when Start / effect mounts
-    void runTick();
+    // First tick right away on Start; when resuming after a reload, respect the
+    // time elapsed since the last tick.
+    const last = strategyRef.current.lastTickAt
+      ? Date.parse(strategyRef.current.lastTickAt)
+      : NaN;
+    const wait = Number.isFinite(last)
+      ? Math.max(0, TICK_BASE_MS - (Date.now() - last))
+      : 0;
+    if (wait > 0) schedule(wait);
+    else void runTick();
 
     const onVisibility = () => {
-      if (document.visibilityState === "visible" && runningRef.current) {
-        backoffMs.current = TICK_BASE_MS;
+      if (document.visibilityState !== "visible") return;
+      const l = strategyRef.current.lastTickAt
+        ? Date.parse(strategyRef.current.lastTickAt)
+        : NaN;
+      // Background tabs get throttled timers: catch up when the tab returns.
+      if (!Number.isFinite(l) || Date.now() - l >= TICK_BASE_MS) {
+        clearTimer();
         void runTick();
       }
     };
@@ -283,7 +471,7 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
       document.removeEventListener("visibilitychange", onVisibility);
       window.removeEventListener("focus", onVisibility);
     };
-  }, [authed, strategy?.running, refresh]);
+  }, [hydrated, authed, running, refresh, commitStrategy, pushLog]);
 
   async function handleLogin(e: React.FormEvent) {
     e.preventDefault();
@@ -308,29 +496,36 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
     setAccount(null);
   }
 
-  async function setStrategyRunning(running: boolean) {
-    setBusy(true);
-    const res = await api<{ strategy: Strategy }>("/api/strategy", {
-      method: "POST",
-      body: JSON.stringify({
-        running,
-        instrument,
-        volume,
+  function setStrategyRunning(next: boolean) {
+    const base = strategyRef.current;
+    if (next) {
+      const cfg = {
+        instrument: instrument.trim().toUpperCase() || "BTCUSD",
+        volume: volume.trim() || "0.01",
         side,
         entryMode,
-        holdTicks,
-        slPct,
-        slUsd,
-        tpPct,
-        tpUsd,
-      }),
-    });
-    setBusy(false);
-    if (res.ok) {
-      setStrategy(res.data.strategy);
-      runningRef.current = res.data.strategy.running;
-      await refresh();
-    } else setError(res.error);
+        holdTicks: Math.max(1, Math.min(120, Number(holdTicks) || 10)),
+        slPct: Math.max(0, Number(slPct) || 0),
+        slUsd: Math.max(0, Number(slUsd) || 0),
+        tpPct: Math.max(0, Number(tpPct) || 0),
+        tpUsd: Math.max(0, Number(tpUsd) || 0),
+      };
+      commitStrategy({
+        ...base,
+        ...cfg,
+        running: true,
+        lastTickAt: null,
+        lastAction: "start",
+        status: base.managedPositionId ? "in_position" : "flat",
+      });
+      pushLog(
+        "info",
+        `Robot iniciado (${cfg.instrument} ${cfg.volume}, SL ${cfg.slPct}%${cfg.slUsd ? ` / $${cfg.slUsd}` : ""}, TP ${cfg.tpPct || cfg.tpUsd ? `${cfg.tpPct}%${cfg.tpUsd ? ` / $${cfg.tpUsd}` : ""}` : "off"}, hold≤${cfg.holdTicks}, entry=${cfg.entryMode})`,
+      );
+    } else {
+      commitStrategy({ ...base, running: false, lastAction: "stop" });
+      pushLog("info", "Robot detenido manualmente (posiciones abiertas no se cierran)");
+    }
   }
 
   async function manualOpen() {
@@ -517,9 +712,9 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
             </p>
           </div>
           <span
-            className={`section-note robot-badge ${strategy?.running ? "on" : ""}`}
+            className={`section-note robot-badge ${running ? "on" : ""}`}
           >
-            {strategy?.running ? "ROBOT ON" : "ROBOT OFF"} · {robotLive}
+            {running ? "ROBOT ON" : "ROBOT OFF"} · {robotLive}
           </span>
         </div>
 
@@ -634,7 +829,7 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
               className="btn danger"
               type="button"
               disabled={busy}
-              onClick={() => void setStrategyRunning(false)}
+              onClick={() => setStrategyRunning(false)}
             >
               Stop robot
             </button>
@@ -643,7 +838,7 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
               className="btn primary"
               type="button"
               disabled={busy}
-              onClick={() => void setStrategyRunning(true)}
+              onClick={() => setStrategyRunning(true)}
             >
               Start robot
             </button>
@@ -659,51 +854,95 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
         </div>
 
         {strategy && (
-          <div className="strategy-status">
-            <span>
-              estado: <strong>{robotLive}</strong>
-            </span>
-            <span>ticks: {strategy.tickCount}</span>
-            <span>
-              hold: {strategy.ticksSinceOpen}/{strategy.holdTicks}
-            </span>
-            <span>
-              SL {strategy.slPct}%
-              {strategy.slUsd > 0 ? ` / $${strategy.slUsd}` : ""}
-            </span>
-            <span>
-              TP{" "}
-              {strategy.tpPct > 0 || strategy.tpUsd > 0
-                ? `${strategy.tpPct}%${strategy.tpUsd > 0 ? ` / $${strategy.tpUsd}` : ""}`
-                : "off"}
-            </span>
-            <span>pos: {strategy.managedPositionId ?? "—"}</span>
-            <span>
-              open@: {strategy.openPrice != null ? fmt(strategy.openPrice) : "—"}
-            </span>
-            <span>
-              last action: {strategy.lastAction ?? "—"}
-            </span>
-            <span>
-              last close: {strategy.lastCloseReason ?? "—"}
-            </span>
-            <span>
-              last tick:{" "}
-              {strategy.lastTickAt ? fmtTime(strategy.lastTickAt) : "—"}
-            </span>
-            <span>
-              poll:{" "}
-              {tickHealth === "ok"
-                ? "~35s"
-                : tickHealth === "backoff"
-                  ? "backoff / tab oculta"
-                  : "idle"}
-            </span>
-            {strategy.lastError && (
-              <span className="neg">err: {strategy.lastError}</span>
-            )}
-          </div>
+          <>
+            <div className={`robot-state ${running ? "on" : "off"}`}>
+              <div className="robot-state-main">
+                <span className="robot-dot" aria-hidden />
+                <strong>{running ? "CORRIENDO" : "DETENIDO"}</strong>
+                <span className="robot-state-sub">
+                  {running
+                    ? tickHealth === "backoff"
+                      ? "reintentando tras error"
+                      : "activo mientras esta pestaña esté abierta"
+                    : "pulsa Start robot para iniciar"}
+                </span>
+              </div>
+              <div className="robot-state-grid">
+                <span>
+                  último tick:{" "}
+                  <strong>
+                    {strategy.lastTickAt ? fmtTime(strategy.lastTickAt) : "—"}
+                  </strong>
+                </span>
+                <span>
+                  próximo tick:{" "}
+                  <strong>
+                    {running && nextTickAt ? fmtTime(new Date(nextTickAt).toISOString()) : "—"}
+                  </strong>
+                </span>
+                <span>
+                  última acción: <strong>{strategy.lastAction ?? "—"}</strong>
+                </span>
+                <span className={lastError ? "neg" : ""}>
+                  último error:{" "}
+                  <strong>
+                    {lastError
+                      ? `${fmtTime(lastError.at)} · ${lastError.message}`
+                      : "—"}
+                  </strong>
+                </span>
+              </div>
+            </div>
+            <div className="strategy-status">
+              <span>
+                estado: <strong>{robotLive}</strong>
+              </span>
+              <span>ticks: {strategy.tickCount}</span>
+              <span>
+                hold: {strategy.ticksSinceOpen}/{strategy.holdTicks}
+              </span>
+              <span>
+                SL {strategy.slPct}%
+                {strategy.slUsd > 0 ? ` / $${strategy.slUsd}` : ""}
+              </span>
+              <span>
+                TP{" "}
+                {strategy.tpPct > 0 || strategy.tpUsd > 0
+                  ? `${strategy.tpPct}%${strategy.tpUsd > 0 ? ` / $${strategy.tpUsd}` : ""}`
+                  : "off"}
+              </span>
+              <span>pos: {strategy.managedPositionId ?? "—"}</span>
+              <span>
+                open@: {strategy.openPrice != null ? fmt(strategy.openPrice) : "—"}
+              </span>
+              <span>last close: {strategy.lastCloseReason ?? "—"}</span>
+              <span>
+                poll:{" "}
+                {tickHealth === "ok"
+                  ? "~35s"
+                  : tickHealth === "backoff"
+                    ? "backoff"
+                    : "idle"}
+              </span>
+            </div>
+          </>
         )}
+
+        <div className="robot-log">
+          <h3>Log del robot</h3>
+          {robotLog.length === 0 ? (
+            <div className="empty">Sin eventos todavía.</div>
+          ) : (
+            <ul>
+              {robotLog.map((l) => (
+                <li key={l.id} className={`log-${l.level}`}>
+                  <time dateTime={l.at}>{fmtTime(l.at)}</time>
+                  <span>{l.text}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
       </section>
 
       <section className="section">
@@ -712,7 +951,7 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
             <h2>Movimientos recientes</h2>
             <p>
               Opens/closes del robot con razón <code>sl</code> · <code>tp</code>{" "}
-              · <code>timeout</code> (memoria del proceso).
+              · <code>timeout</code> (memoria del servidor; el log del robot de arriba persiste en este navegador).
             </p>
           </div>
         </div>
