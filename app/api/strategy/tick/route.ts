@@ -8,8 +8,9 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
 /**
- * One strategy step. Call from the UI poller or externally.
- * Serverless-safe: no forever loop.
+ * One robot step (open if flat, else SL/TP/timeout close).
+ * Call from the UI poller (required on Hobby) or optional Pro cron.
+ * Serverless-safe: no forever loop. loadSettings() refuses live without ALLOW_LIVE.
  */
 export async function POST(req: NextRequest) {
   if (!(await isAuthenticated(req))) return unauthorized();

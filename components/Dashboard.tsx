@@ -34,6 +34,7 @@ type Movement = {
   message: string;
   instrument?: string;
   pnl?: string | number | null;
+  reason?: "sl" | "tp" | "timeout";
 };
 
 type Strategy = {
@@ -41,13 +42,26 @@ type Strategy = {
   instrument: string;
   volume: string;
   side: "buy" | "sell";
+  entryMode: "alternate" | "random" | "fixed";
   holdTicks: number;
+  slPct: number;
+  slUsd: number;
+  tpPct: number;
+  tpUsd: number;
   ticksSinceOpen: number;
   managedPositionId: string | null;
+  managedSide: "buy" | "sell" | null;
+  openPrice: number | null;
   lastTickAt: string | null;
   lastError: string | null;
+  lastAction: string | null;
+  lastCloseReason: "sl" | "tp" | "timeout" | null;
+  status: "flat" | "in_position" | "opening" | "closing";
   tickCount: number;
 };
+
+const TICK_BASE_MS = 35_000;
+const TICK_MAX_MS = 120_000;
 
 function fmt(n: string | number | null | undefined, digits = 2): string {
   if (n == null || n === "") return "—";
@@ -71,6 +85,15 @@ function fmtTime(iso: string): string {
   } catch {
     return iso;
   }
+}
+
+function statusLabel(s: Strategy | null): string {
+  if (!s) return "—";
+  if (!s.running) return "parado";
+  if (s.status === "in_position" || s.managedPositionId) return "en posición";
+  if (s.status === "opening") return "abriendo";
+  if (s.status === "closing") return "cerrando";
+  return "flat";
 }
 
 async function api<T>(
@@ -108,9 +131,23 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
   const [instrument, setInstrument] = useState("BTCUSD");
   const [volume, setVolume] = useState("0.01");
   const [side, setSide] = useState<"buy" | "sell">("buy");
+  const [entryMode, setEntryMode] = useState<"alternate" | "random" | "fixed">(
+    "alternate",
+  );
+  const [holdTicks, setHoldTicks] = useState(10);
+  const [slPct, setSlPct] = useState(0.3);
+  const [slUsd, setSlUsd] = useState(0);
+  const [tpPct, setTpPct] = useState(0);
+  const [tpUsd, setTpUsd] = useState(0);
   const [secret, setSecret] = useState("");
   const [authed, setAuthed] = useState(!needsAuth);
+  const [tickHealth, setTickHealth] = useState<"ok" | "backoff" | "idle">(
+    "idle",
+  );
   const tickLock = useRef(false);
+  const backoffMs = useRef(TICK_BASE_MS);
+  const runningRef = useRef(false);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const refresh = useCallback(async () => {
     const [a, p, m, s] = await Promise.all([
@@ -132,10 +169,20 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
     if (p.ok) setPositions(p.data.positions);
     if (m.ok) setMovements(m.data.movements);
     if (s.ok) {
-      setStrategy(s.data.strategy);
-      setInstrument(s.data.strategy.instrument || "BTCUSD");
-      setVolume(s.data.strategy.volume || "0.01");
-      setSide(s.data.strategy.side || "buy");
+      const st = s.data.strategy;
+      setStrategy(st);
+      runningRef.current = st.running;
+      if (!st.running) {
+        setInstrument(st.instrument || "BTCUSD");
+        setVolume(st.volume || "0.01");
+        setSide(st.side || "buy");
+        setEntryMode(st.entryMode || "alternate");
+        setHoldTicks(st.holdTicks ?? 10);
+        setSlPct(st.slPct ?? 0.3);
+        setSlUsd(st.slUsd ?? 0);
+        setTpPct(st.tpPct ?? 0);
+        setTpUsd(st.tpUsd ?? 0);
+      }
     }
   }, []);
 
@@ -146,20 +193,96 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
     return () => clearInterval(id);
   }, [authed, refresh]);
 
-  // Strategy tick poller — UI drives ticks when running (serverless-safe).
+  // Strategy tick poller — UI drives ticks when running (Hobby-safe).
+  // Visibility-aware + exponential backoff on errors.
   useEffect(() => {
-    if (!authed || !strategy?.running) return;
-    const id = setInterval(async () => {
-      if (tickLock.current) return;
+    if (!authed || !strategy?.running) {
+      runningRef.current = false;
+      setTickHealth("idle");
+      if (timerRef.current) {
+        clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
+      return;
+    }
+
+    runningRef.current = true;
+    let cancelled = false;
+    backoffMs.current = TICK_BASE_MS;
+
+    const clearTimer = () => {
+      if (timerRef.current) {
+        clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
+    };
+
+    const schedule = (ms: number) => {
+      clearTimer();
+      timerRef.current = setTimeout(() => {
+        void runTick();
+      }, ms);
+    };
+
+    const runTick = async () => {
+      if (cancelled || !runningRef.current) return;
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        setTickHealth("backoff");
+        schedule(TICK_BASE_MS);
+        return;
+      }
+      if (tickLock.current) {
+        schedule(2_000);
+        return;
+      }
       tickLock.current = true;
       try {
-        await api("/api/strategy/tick", { method: "POST" });
+        const res = await api("/api/strategy/tick", { method: "POST" });
+        if (!res.ok) {
+          backoffMs.current = Math.min(
+            TICK_MAX_MS,
+            Math.round(backoffMs.current * 1.6),
+          );
+          setTickHealth("backoff");
+          setError(res.error);
+        } else {
+          backoffMs.current = TICK_BASE_MS;
+          setTickHealth("ok");
+        }
         await refresh();
+      } catch (err) {
+        backoffMs.current = Math.min(
+          TICK_MAX_MS,
+          Math.round(backoffMs.current * 1.6),
+        );
+        setTickHealth("backoff");
+        setError(err instanceof Error ? err.message : String(err));
       } finally {
         tickLock.current = false;
+        if (!cancelled && runningRef.current) {
+          schedule(backoffMs.current);
+        }
       }
-    }, 35_000);
-    return () => clearInterval(id);
+    };
+
+    // Immediate first tick when Start / effect mounts
+    void runTick();
+
+    const onVisibility = () => {
+      if (document.visibilityState === "visible" && runningRef.current) {
+        backoffMs.current = TICK_BASE_MS;
+        void runTick();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("focus", onVisibility);
+
+    return () => {
+      cancelled = true;
+      clearTimer();
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("focus", onVisibility);
+    };
   }, [authed, strategy?.running, refresh]);
 
   async function handleLogin(e: React.FormEvent) {
@@ -194,16 +317,18 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
         instrument,
         volume,
         side,
-        holdTicks: strategy?.holdTicks ?? 3,
+        entryMode,
+        holdTicks,
+        slPct,
+        slUsd,
+        tpPct,
+        tpUsd,
       }),
     });
     setBusy(false);
     if (res.ok) {
       setStrategy(res.data.strategy);
-      if (running) {
-        // Immediate first tick
-        await api("/api/strategy/tick", { method: "POST" });
-      }
+      runningRef.current = res.data.strategy.running;
       await refresh();
     } else setError(res.error);
   }
@@ -263,6 +388,7 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
 
   const state = account?.accountState;
   const currency = state?.currency ? String(state.currency) : "";
+  const robotLive = statusLabel(strategy);
 
   return (
     <div className="shell">
@@ -281,8 +407,9 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
           <span> · Exness</span>
         </h1>
         <p className="hero-lead">
-          Panel demo de trading: equity en vivo, posiciones abiertas y un
-          bucle de estrategia mínimo para probar open/close.
+          Panel demo con robot automático: abre/cierra sin clics, con stop loss
+          simple y take profit opcional. Deja el panel abierto para que haga
+          ticks (Hobby no tiene cron por minuto).
         </p>
 
         <div className="equity-block">
@@ -382,14 +509,17 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
       <section className="section">
         <div className="section-head">
           <div>
-            <h2>Estrategia placeholder</h2>
+            <h2>Robot automático</h2>
             <p>
-              Tick serverless: abre un lote mínimo, espera N ticks, cierra.
-              No está optimizada — solo prueba el bucle.
+              Si flat → open mercado (lado alternate / random / fixed). Luego
+              cierra por SL, TP opcional o timeout de ticks. No está optimizado —
+              solo inventable para demo.
             </p>
           </div>
-          <span className="section-note">
-            {strategy?.running ? "RUNNING" : "STOPPED"}
+          <span
+            className={`section-note robot-badge ${strategy?.running ? "on" : ""}`}
+          >
+            {strategy?.running ? "ROBOT ON" : "ROBOT OFF"} · {robotLive}
           </span>
         </div>
 
@@ -413,16 +543,91 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
             />
           </div>
           <div className="field">
-            <label htmlFor="side">Lado</label>
+            <label htmlFor="entryMode">Entrada</label>
+            <select
+              id="entryMode"
+              value={entryMode}
+              onChange={(e) =>
+                setEntryMode(e.target.value as "alternate" | "random" | "fixed")
+              }
+              disabled={strategy?.running || busy}
+            >
+              <option value="alternate">alternate</option>
+              <option value="random">random</option>
+              <option value="fixed">fixed</option>
+            </select>
+          </div>
+          <div className="field">
+            <label htmlFor="side">Lado (fixed)</label>
             <select
               id="side"
               value={side}
               onChange={(e) => setSide(e.target.value as "buy" | "sell")}
-              disabled={strategy?.running || busy}
+              disabled={strategy?.running || busy || entryMode !== "fixed"}
             >
               <option value="buy">buy</option>
               <option value="sell">sell</option>
             </select>
+          </div>
+          <div className="field">
+            <label htmlFor="slPct">SL %</label>
+            <input
+              id="slPct"
+              type="number"
+              step="0.1"
+              min="0"
+              value={slPct}
+              onChange={(e) => setSlPct(Number(e.target.value))}
+              disabled={strategy?.running || busy}
+            />
+          </div>
+          <div className="field">
+            <label htmlFor="slUsd">SL $ (opc.)</label>
+            <input
+              id="slUsd"
+              type="number"
+              step="0.5"
+              min="0"
+              value={slUsd}
+              onChange={(e) => setSlUsd(Number(e.target.value))}
+              disabled={strategy?.running || busy}
+            />
+          </div>
+          <div className="field">
+            <label htmlFor="tpPct">TP % (opc.)</label>
+            <input
+              id="tpPct"
+              type="number"
+              step="0.1"
+              min="0"
+              value={tpPct}
+              onChange={(e) => setTpPct(Number(e.target.value))}
+              disabled={strategy?.running || busy}
+            />
+          </div>
+          <div className="field">
+            <label htmlFor="tpUsd">TP $ (opc.)</label>
+            <input
+              id="tpUsd"
+              type="number"
+              step="0.5"
+              min="0"
+              value={tpUsd}
+              onChange={(e) => setTpUsd(Number(e.target.value))}
+              disabled={strategy?.running || busy}
+            />
+          </div>
+          <div className="field">
+            <label htmlFor="holdTicks">Max hold ticks</label>
+            <input
+              id="holdTicks"
+              type="number"
+              min="1"
+              max="120"
+              value={holdTicks}
+              onChange={(e) => setHoldTicks(Number(e.target.value))}
+              disabled={strategy?.running || busy}
+            />
           </div>
           {strategy?.running ? (
             <button
@@ -431,7 +636,7 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
               disabled={busy}
               onClick={() => void setStrategyRunning(false)}
             >
-              Detener
+              Stop robot
             </button>
           ) : (
             <button
@@ -440,7 +645,7 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
               disabled={busy}
               onClick={() => void setStrategyRunning(true)}
             >
-              Iniciar
+              Start robot
             </button>
           )}
           <button
@@ -455,14 +660,44 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
 
         {strategy && (
           <div className="strategy-status">
+            <span>
+              estado: <strong>{robotLive}</strong>
+            </span>
             <span>ticks: {strategy.tickCount}</span>
             <span>
               hold: {strategy.ticksSinceOpen}/{strategy.holdTicks}
             </span>
+            <span>
+              SL {strategy.slPct}%
+              {strategy.slUsd > 0 ? ` / $${strategy.slUsd}` : ""}
+            </span>
+            <span>
+              TP{" "}
+              {strategy.tpPct > 0 || strategy.tpUsd > 0
+                ? `${strategy.tpPct}%${strategy.tpUsd > 0 ? ` / $${strategy.tpUsd}` : ""}`
+                : "off"}
+            </span>
             <span>pos: {strategy.managedPositionId ?? "—"}</span>
             <span>
-              last:{" "}
+              open@: {strategy.openPrice != null ? fmt(strategy.openPrice) : "—"}
+            </span>
+            <span>
+              last action: {strategy.lastAction ?? "—"}
+            </span>
+            <span>
+              last close: {strategy.lastCloseReason ?? "—"}
+            </span>
+            <span>
+              last tick:{" "}
               {strategy.lastTickAt ? fmtTime(strategy.lastTickAt) : "—"}
+            </span>
+            <span>
+              poll:{" "}
+              {tickHealth === "ok"
+                ? "~35s"
+                : tickHealth === "backoff"
+                  ? "backoff / tab oculta"
+                  : "idle"}
             </span>
             {strategy.lastError && (
               <span className="neg">err: {strategy.lastError}</span>
@@ -475,7 +710,10 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
         <div className="section-head">
           <div>
             <h2>Movimientos recientes</h2>
-            <p>Opens, closes y eventos de estrategia (memoria del proceso).</p>
+            <p>
+              Opens/closes del robot con razón <code>sl</code> · <code>tp</code>{" "}
+              · <code>timeout</code> (memoria del proceso).
+            </p>
           </div>
         </div>
         {movements.length === 0 ? (
@@ -487,8 +725,14 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
                 <time dateTime={m.at}>{fmtTime(m.at)}</time>
                 <div>
                   <span className="kind">{m.kind}</span>
+                  {m.reason && (
+                    <span className={`reason-tag reason-${m.reason}`}>
+                      {m.reason}
+                    </span>
+                  )}
                   {m.message}
                   {m.instrument ? ` · ${m.instrument}` : ""}
+                  {m.pnl != null ? ` · pnl ${fmt(m.pnl)}` : ""}
                 </div>
               </li>
             ))}

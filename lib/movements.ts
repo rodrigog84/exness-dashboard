@@ -13,6 +13,8 @@ export type Movement = {
   positionId?: string;
   operationId?: string;
   pnl?: string | number | null;
+  /** Close reason from the robot: sl | tp | timeout */
+  reason?: "sl" | "tp" | "timeout";
   message: string;
   meta?: Record<string, unknown>;
 };
@@ -45,6 +47,7 @@ export function pushMovement(
     positionId: entry.positionId,
     operationId: entry.operationId,
     pnl: entry.pnl ?? null,
+    reason: entry.reason,
     message: entry.message,
     meta: entry.meta,
   };

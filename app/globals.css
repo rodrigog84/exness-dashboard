@@ -397,6 +397,43 @@ button {
   color: var(--ink-dim);
 }
 
+.strategy-status strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.robot-badge.on {
+  color: var(--accent);
+}
+
+.reason-tag {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-right: 0.45rem;
+  padding: 0.12rem 0.4rem;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  color: var(--ink-dim);
+}
+
+.reason-tag.reason-sl {
+  border-color: rgba(255, 107, 107, 0.45);
+  color: var(--danger);
+}
+
+.reason-tag.reason-tp {
+  border-color: rgba(62, 207, 154, 0.45);
+  color: var(--accent);
+}
+
+.reason-tag.reason-timeout {
+  border-color: rgba(232, 196, 104, 0.45);
+  color: #e8c468;
+}
+
 .movements {
   list-style: none;
   margin: 0;
