@@ -9,3 +9,4 @@ out
 .vercel
 tsconfig.tsbuildinfo
 .next-env.d.ts.bak
+scripts/.cache/

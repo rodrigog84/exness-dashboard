@@ -3,6 +3,8 @@
  * Cold starts on serverless reset this — documented in README.
  */
 
+import type { CloseReason } from "./trend/params";
+
 export type Movement = {
   id: string;
   at: string;
@@ -13,8 +15,8 @@ export type Movement = {
   positionId?: string;
   operationId?: string;
   pnl?: string | number | null;
-  /** Close reason from the robot: sl | tp | timeout */
-  reason?: "sl" | "tp" | "timeout";
+  /** Close reason from the robot: sl | tp | timeout | trail | cross | broker */
+  reason?: CloseReason;
   message: string;
   meta?: Record<string, unknown>;
 };

@@ -1,6 +1,16 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { StrategyConfig as Strategy, TickResult } from "@/lib/strategy";
+import { HOUR_MS, nextEvalTime } from "@/lib/trend/engine";
+import {
+  CANDLE_SOURCES,
+  DEFAULT_TREND,
+  defaultRuntime,
+  sanitizeTrendParams,
+  type CloseReason,
+  type TrendParams,
+} from "@/lib/trend/params";
 
 type AccountPayload = {
   env: string;
@@ -36,41 +46,10 @@ type Movement = {
   message: string;
   instrument?: string;
   pnl?: string | number | null;
-  reason?: "sl" | "tp" | "timeout";
+  reason?: CloseReason;
 };
 
-type Strategy = {
-  running: boolean;
-  instrument: string;
-  volume: string;
-  side: "buy" | "sell";
-  entryMode: "alternate" | "random" | "fixed";
-  holdTicks: number;
-  slPct: number;
-  slUsd: number;
-  tpPct: number;
-  tpUsd: number;
-  ticksSinceOpen: number;
-  managedPositionId: string | null;
-  managedSide: "buy" | "sell" | null;
-  openPrice: number | null;
-  lastTickAt: string | null;
-  lastError: string | null;
-  lastAction: string | null;
-  lastCloseReason: "sl" | "tp" | "timeout" | null;
-  status: "flat" | "in_position" | "opening" | "closing";
-  tickCount: number;
-  pendingBefore: string[] | null;
-};
-
-type TickResponse = {
-  state: Strategy;
-  action: "noop" | "open" | "close" | "skipped" | "error" | "rate_limited";
-  detail?: string;
-  reason?: "sl" | "tp" | "timeout";
-  retryAfterSec?: number;
-  accessPoint?: string | null;
-};
+type TickResponse = TickResult & { accessPoint?: string | null };
 
 type RobotLogEntry = {
   id: string;
@@ -103,12 +82,14 @@ function initialStrategy(): Strategy {
     instrument: "BTCUSD",
     volume: "0.01",
     side: "buy",
-    entryMode: "alternate",
+    entryMode: "trend",
     holdTicks: 10,
     slPct: 0.3,
     slUsd: 0,
     tpPct: 0,
     tpUsd: 0,
+    trend: { ...DEFAULT_TREND },
+    trendRuntime: defaultRuntime(),
     ticksSinceOpen: 0,
     managedPositionId: null,
     managedSide: null,
@@ -129,14 +110,35 @@ function loadPersisted(): PersistedRobot | null {
     if (!raw) return null;
     const j = JSON.parse(raw) as Partial<PersistedRobot>;
     if (!j.strategy || typeof j.strategy !== "object") return null;
+    const saved = j.strategy as Partial<Strategy>;
+    const base = initialStrategy();
+    const strategy: Strategy = {
+      ...base,
+      ...saved,
+      trend: sanitizeTrendParams(saved.trend, base.trend),
+      trendRuntime: { ...base.trendRuntime, ...(saved.trendRuntime ?? {}) },
+      // state saved before the trend strategy existed: move to the new default mode
+      entryMode: saved.trend ? (saved.entryMode ?? "trend") : "trend",
+    };
     return {
-      strategy: { ...initialStrategy(), ...j.strategy },
+      strategy,
       log: Array.isArray(j.log) ? j.log.slice(0, LOG_MAX) : [],
       lastError: j.lastError ?? null,
     };
   } catch {
     return null;
   }
+}
+
+function tickLogs(r: TickResponse): { level: RobotLogEntry["level"]; text: string }[] {
+  if (r.logs) {
+    const lines = r.logs.map((l) => ({ level: l.level, text: l.text }));
+    if (r.action === "error" && !lines.some((l) => l.level === "error")) {
+      lines.push(describeTick(r));
+    }
+    return lines;
+  }
+  return [describeTick(r)];
 }
 
 function describeTick(r: TickResponse): { level: RobotLogEntry["level"]; text: string } {
@@ -273,9 +275,11 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
   const [instrument, setInstrument] = useState("BTCUSD");
   const [volume, setVolume] = useState("0.01");
   const [side, setSide] = useState<"buy" | "sell">("buy");
-  const [entryMode, setEntryMode] = useState<"alternate" | "random" | "fixed">(
-    "alternate",
-  );
+  const [entryMode, setEntryMode] = useState<Strategy["entryMode"]>("trend");
+  const [trendForm, setTrendForm] = useState<TrendParams>({ ...DEFAULT_TREND });
+  const setTrendField = <K extends keyof TrendParams>(k: K, v: TrendParams[K]) =>
+    setTrendForm((t) => ({ ...t, [k]: v }));
+  const [clock, setClock] = useState(() => Date.now());
   const [holdTicks, setHoldTicks] = useState(10);
   const [slPct, setSlPct] = useState(0.3);
   const [slUsd, setSlUsd] = useState(0);
@@ -380,6 +384,7 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
       setVolume(st.volume);
       setSide(st.side);
       setEntryMode(st.entryMode);
+      setTrendForm(st.trend);
       setHoldTicks(st.holdTicks);
       setSlPct(st.slPct);
       setSlUsd(st.slUsd);
@@ -390,6 +395,11 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
   }, []);
 
   const running = strategy?.running === true;
+
+  useEffect(() => {
+    const id = setInterval(() => setClock(Date.now()), 15_000);
+    return () => clearInterval(id);
+  }, []);
 
   // Tick poller. The UI drives ticks (Hobby has no minute cron). Every tick
   // sends the full robot state, so server cold starts cannot stop the robot,
@@ -459,8 +469,7 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
             running: wasRunning,
             lastTickAt: nowIso,
           });
-          const d = describeTick(r);
-          pushLog(d.level, d.text);
+          for (const d of tickLogs(r)) pushLog(d.level, d.text);
           if (r.action === "rate_limited") {
             consecutiveRateLimits += 1;
             delay = rateLimitDelay(r.retryAfterSec);
@@ -592,10 +601,30 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
         slUsd: Math.max(0, Number(slUsd) || 0),
         tpPct: Math.max(0, Number(tpPct) || 0),
         tpUsd: Math.max(0, Number(tpUsd) || 0),
+        trend: sanitizeTrendParams(trendForm, base.trend),
       };
+      const t0 = base.trend;
+      const t1 = cfg.trend;
+      const indicatorsChanged =
+        t0.timeframeHours !== t1.timeframeHours ||
+        t0.emaFast !== t1.emaFast ||
+        t0.emaSlow !== t1.emaSlow ||
+        t0.emaTrend !== t1.emaTrend ||
+        t0.atrPeriod !== t1.atrPeriod ||
+        t0.candleSource !== t1.candleSource ||
+        base.instrument !== cfg.instrument;
       commitStrategy({
         ...base,
         ...cfg,
+        trendRuntime: indicatorsChanged
+          ? {
+              ...base.trendRuntime,
+              lastCandleTime: null,
+              indicators: null,
+              lastSignal: null,
+              limits: null,
+            }
+          : base.trendRuntime,
         running: true,
         lastTickAt: null,
         lastAction: "start",
@@ -603,7 +632,9 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
       });
       pushLog(
         "info",
-        `Robot iniciado (${cfg.instrument} ${cfg.volume}, SL ${cfg.slPct}%${cfg.slUsd ? ` / $${cfg.slUsd}` : ""}, TP ${cfg.tpPct || cfg.tpUsd ? `${cfg.tpPct}%${cfg.tpUsd ? ` / $${cfg.tpUsd}` : ""}` : "off"}, hold≤${cfg.holdTicks}, entry=${cfg.entryMode})`,
+        cfg.entryMode === "trend"
+          ? `Robot iniciado: tendencia ${cfg.instrument} ${t1.timeframeHours}h, EMA ${t1.emaFast}/${t1.emaSlow}/${t1.emaTrend}, SL ${t1.slAtrMult}×ATR(${t1.atrPeriod}), TP ${t1.tpR ? `${t1.tpR}R` : "off"}${t1.trailing ? " + trailing" : ""}, riesgo ${t1.riskPct}%, cooldown ${t1.cooldownCandles} velas, pausa diaria ${t1.dailyLossPct}%`
+          : `Robot iniciado (${cfg.instrument} ${cfg.volume}, SL ${cfg.slPct}%${cfg.slUsd ? ` / $${cfg.slUsd}` : ""}, TP ${cfg.tpPct || cfg.tpUsd ? `${cfg.tpPct}%${cfg.tpUsd ? ` / $${cfg.tpUsd}` : ""}` : "off"}, hold≤${cfg.holdTicks}, entry=${cfg.entryMode})`,
       );
     } else {
       commitStrategy({ ...base, running: false, lastAction: "stop" });
@@ -667,6 +698,29 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
   const state = account?.accountState;
   const currency = state?.currency ? String(state.currency) : "";
   const robotLive = statusLabel(strategy);
+  const isTrend = entryMode === "trend";
+  const formLocked = strategy?.running || busy;
+  const trendNum = (
+    key: keyof TrendParams,
+    label: string,
+    step = 1,
+    min = 0,
+    max?: number,
+  ) => (
+    <div className="field" key={key}>
+      <label htmlFor={`t-${key}`}>{label}</label>
+      <input
+        id={`t-${key}`}
+        type="number"
+        step={step}
+        min={min}
+        max={max}
+        value={trendForm[key] as number}
+        onChange={(e) => setTrendField(key, Number(e.target.value) as never)}
+        disabled={formLocked}
+      />
+    </div>
+  );
 
   return (
     <div className="shell">
@@ -685,8 +739,8 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
           <span> · Exness</span>
         </h1>
         <p className="hero-lead">
-          Panel demo con robot automático: abre/cierra sin clics, con stop loss
-          simple y take profit opcional. Deja el panel abierto para que haga
+          Panel demo con robot de seguir tendencia (BTC, velas cerradas, EMA +
+          ATR, riesgo fijo por operación). Deja el panel abierto para que haga
           ticks (Hobby no tiene cron por minuto).
         </p>
 
@@ -789,9 +843,9 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
           <div>
             <h2>Robot automático</h2>
             <p>
-              Si flat → open mercado (lado alternate / random / fixed). Luego
-              cierra por SL, TP opcional o timeout de ticks. No está optimizado —
-              solo inventable para demo.
+              {isTrend
+                ? "Seguir tendencia: evalúa solo al cerrar cada vela. Compra si EMA rápida cruza sobre la lenta y precio > EMA de tendencia (venta al revés); una posición a la vez; SL en ATR, TP en R, frenos de pérdida diaria / cooldown / spread."
+                : "Modo legacy: si flat → open mercado (alternate / random / fixed). Luego cierra por SL %, TP opcional o timeout de ticks. Sin ventaja estadística — solo demo."}
             </p>
           </div>
           <span
@@ -811,30 +865,93 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
               disabled={strategy?.running || busy}
             />
           </div>
-          <div className="field">
-            <label htmlFor="volume">Volumen</label>
-            <input
-              id="volume"
-              value={volume}
-              onChange={(e) => setVolume(e.target.value)}
-              disabled={strategy?.running || busy}
-            />
-          </div>
+          {!isTrend && (
+            <div className="field">
+              <label htmlFor="volume">Volumen</label>
+              <input
+                id="volume"
+                value={volume}
+                onChange={(e) => setVolume(e.target.value)}
+                disabled={strategy?.running || busy}
+              />
+            </div>
+          )}
           <div className="field">
             <label htmlFor="entryMode">Entrada</label>
             <select
               id="entryMode"
               value={entryMode}
-              onChange={(e) =>
-                setEntryMode(e.target.value as "alternate" | "random" | "fixed")
-              }
+              onChange={(e) => setEntryMode(e.target.value as Strategy["entryMode"])}
               disabled={strategy?.running || busy}
             >
+              <option value="trend">trend (seguir tendencia)</option>
               <option value="alternate">alternate</option>
               <option value="random">random</option>
               <option value="fixed">fixed</option>
             </select>
           </div>
+          {isTrend && (
+            <>
+              <div className="field">
+                <label htmlFor="t-tf">Timeframe</label>
+                <select
+                  id="t-tf"
+                  value={trendForm.timeframeHours}
+                  onChange={(e) =>
+                    setTrendField("timeframeHours", Number(e.target.value) === 4 ? 4 : 1)
+                  }
+                  disabled={formLocked}
+                >
+                  <option value={1}>1h</option>
+                  <option value={4}>4h (mejor en backtest)</option>
+                </select>
+              </div>
+              {trendNum("emaFast", "EMA rápida", 1, 2, 300)}
+              {trendNum("emaSlow", "EMA lenta", 1, 3, 400)}
+              {trendNum("emaTrend", "EMA tendencia", 1, 5, 600)}
+              {trendNum("atrPeriod", "ATR período", 1, 2, 100)}
+              {trendNum("slAtrMult", "SL × ATR", 0.1, 0.3, 10)}
+              {trendNum("tpR", "TP (R, 0=off)", 0.5, 0, 10)}
+              <div className="field">
+                <label htmlFor="t-trailing">Trailing</label>
+                <select
+                  id="t-trailing"
+                  value={trendForm.trailing ? "on" : "off"}
+                  onChange={(e) => setTrendField("trailing", e.target.value === "on")}
+                  disabled={formLocked}
+                >
+                  <option value="off">off</option>
+                  <option value="on">on</option>
+                </select>
+              </div>
+              {trendNum("trailActivateR", "Trailing desde (R)", 0.5, 0, 10)}
+              {trendNum("trailAtrMult", "Trailing × ATR", 0.1, 0.3, 10)}
+              {trendNum("riskPct", "Riesgo % equity", 0.1, 0.05, 2)}
+              {trendNum("maxVolume", "Volumen máx. (lotes)", 0.01, 0.001, 1000)}
+              {trendNum("maxSpreadPct", "Spread máx. % (0=off)", 0.01, 0, 5)}
+              {trendNum("cooldownCandles", "Cooldown (velas)", 1, 0, 48)}
+              {trendNum("dailyLossPct", "Pausa pérdida día %", 0.5, 0.5, 20)}
+              <div className="field">
+                <label htmlFor="t-source">Fuente de velas</label>
+                <select
+                  id="t-source"
+                  value={trendForm.candleSource}
+                  onChange={(e) =>
+                    setTrendField("candleSource", e.target.value as TrendParams["candleSource"])
+                  }
+                  disabled={formLocked}
+                >
+                  {CANDLE_SOURCES.map((c) => (
+                    <option key={c} value={c}>
+                      {c}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </>
+          )}
+          {!isTrend && (
+            <>
           <div className="field">
             <label htmlFor="side">Lado (fixed)</label>
             <select
@@ -907,6 +1024,8 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
               disabled={strategy?.running || busy}
             />
           </div>
+            </>
+          )}
           {strategy?.running ? (
             <button
               className="btn danger"
@@ -978,24 +1097,121 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
                 </span>
               </div>
             </div>
+            {strategy.entryMode === "trend" && (() => {
+              const rt = strategy.trendRuntime;
+              const tp = strategy.trend;
+              const tfMs = tp.timeframeHours * HOUR_MS;
+              const ind = rt.indicators;
+              const eq = rt.equity ?? (state?.equity != null ? Number(state.equity) : null);
+              const next = rt.nextEvalAt ?? nextEvalTime(clock, tp);
+              const nextShown = Math.max(next, nextEvalTime(clock, tp));
+              const cdLeft =
+                rt.lastCandleTime != null
+                  ? Math.max(0, Math.ceil((rt.cooldownUntil - rt.lastCandleTime - tfMs) / tfMs))
+                  : 0;
+              const bias = ind
+                ? ind.close > ind.emaTrend && ind.emaFast > ind.emaSlow
+                  ? "alcista"
+                  : ind.close < ind.emaTrend && ind.emaFast < ind.emaSlow
+                    ? "bajista"
+                    : "mixta / sin tendencia clara"
+                : "—";
+              const sig = rt.lastSignal;
+              const pos = rt.pos;
+              const cell = (k: string, v: React.ReactNode, cls = "") => (
+                <div className={`trend-cell ${cls}`}>
+                  <span className="k">{k}</span>
+                  <span className="v">{v}</span>
+                </div>
+              );
+              return (
+                <div className="trend-grid">
+                  {cell(`EMA ${tp.emaFast}`, ind ? fmt(ind.emaFast) : "—")}
+                  {cell(`EMA ${tp.emaSlow}`, ind ? fmt(ind.emaSlow) : "—")}
+                  {cell(`EMA ${tp.emaTrend}`, ind ? fmt(ind.emaTrend) : "—")}
+                  {cell(`ATR ${tp.atrPeriod}`, ind ? fmt(ind.atr) : "—")}
+                  {cell(
+                    "Última vela",
+                    ind
+                      ? `${new Date(ind.t).toISOString().slice(5, 16).replace("T", " ")}Z · ${fmt(ind.close)} · ${ind.source}`
+                      : "—",
+                  )}
+                  {cell("Sesgo", bias)}
+                  {cell(
+                    "Última señal",
+                    sig
+                      ? `${sig.side ? sig.side.toUpperCase() : "ninguna"} · vela ${new Date(sig.candleTime).toISOString().slice(5, 16).replace("T", " ")}Z`
+                      : "—",
+                    sig?.side === "buy" ? "pos" : sig?.side === "sell" ? "neg" : "",
+                  )}
+                  {cell(
+                    "Próxima evaluación",
+                    new Date(nextShown).toLocaleString("es-ES", {
+                      day: "2-digit",
+                      month: "2-digit",
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    }),
+                  )}
+                  {cell(
+                    "Riesgo por operación",
+                    `${tp.riskPct}%${eq != null ? ` ≈ $${fmt((eq * tp.riskPct) / 100)}` : ""}${rt.riskUsd != null ? ` (última: $${fmt(rt.riskUsd)})` : ""}`,
+                  )}
+                  {cell(
+                    "PnL del día (UTC)",
+                    rt.dayPnl != null
+                      ? `${rt.dayPnl >= 0 ? "+" : ""}${fmt(rt.dayPnl)} (${fmt(rt.dayPnlPct ?? 0)}%) · límite -${tp.dailyLossPct}%`
+                      : "—",
+                    rt.dayPnl != null ? (rt.dayPnl >= 0 ? "pos" : "neg") : "",
+                  )}
+                  {cell(
+                    "Freno: pérdida diaria",
+                    rt.dayPaused ? "PAUSA hasta 00:00 UTC" : "ok",
+                    rt.dayPaused ? "neg" : "",
+                  )}
+                  {cell(
+                    "Freno: cooldown",
+                    cdLeft > 0 ? `${cdLeft} vela(s) restantes` : "ok",
+                    cdLeft > 0 ? "neg" : "",
+                  )}
+                  {cell(
+                    "Freno: spread",
+                    rt.lastSpread != null
+                      ? `${fmt(rt.lastSpread)} (${fmt(rt.lastSpreadPct ?? 0, 3)}%) · máx ${tp.maxSpreadPct ? `${tp.maxSpreadPct}%` : "off"}`
+                      : `sin dato · máx ${tp.maxSpreadPct ? `${tp.maxSpreadPct}%` : "off"}`,
+                  )}
+                  {cell(
+                    "Posición",
+                    pos
+                      ? `${pos.side.toUpperCase()} ${pos.vol} @ ${fmt(pos.entry)} · SL ${fmt(pos.sl)}${pos.tp != null ? ` · TP ${fmt(pos.tp)}` : ""}${pos.trailActive ? " (trailing)" : ""} · ${pos.brokerStops ? "SL/TP en broker" : "SL/TP vigilados"}`
+                      : "flat",
+                  )}
+                </div>
+              );
+            })()}
             <div className="strategy-status">
               <span>
                 estado: <strong>{robotLive}</strong>
               </span>
               <span>ticks: {strategy.tickCount}</span>
-              <span>
-                hold: {strategy.ticksSinceOpen}/{strategy.holdTicks}
-              </span>
-              <span>
-                SL {strategy.slPct}%
-                {strategy.slUsd > 0 ? ` / $${strategy.slUsd}` : ""}
-              </span>
-              <span>
-                TP{" "}
-                {strategy.tpPct > 0 || strategy.tpUsd > 0
-                  ? `${strategy.tpPct}%${strategy.tpUsd > 0 ? ` / $${strategy.tpUsd}` : ""}`
-                  : "off"}
-              </span>
+              {strategy.entryMode !== "trend" && (
+                <>
+                  <span>
+                    hold: {strategy.ticksSinceOpen}/{strategy.holdTicks}
+                  </span>
+                  <span>
+                    SL {strategy.slPct}%
+                    {strategy.slUsd > 0 ? ` / $${strategy.slUsd}` : ""}
+                  </span>
+                  <span>
+                    TP{" "}
+                    {strategy.tpPct > 0 || strategy.tpUsd > 0
+                      ? `${strategy.tpPct}%${strategy.tpUsd > 0 ? ` / $${strategy.tpUsd}` : ""}`
+                      : "off"}
+                  </span>
+                </>
+              )}
+              <span>modo: {strategy.entryMode}</span>
               <span>pos: {strategy.managedPositionId ?? "—"}</span>
               <span>
                 open@: {strategy.openPrice != null ? fmt(strategy.openPrice) : "—"}
@@ -1038,7 +1254,7 @@ export function Dashboard({ needsAuth }: { needsAuth: boolean }) {
             <h2>Movimientos recientes</h2>
             <p>
               Opens/closes del robot con razón <code>sl</code> · <code>tp</code>{" "}
-              · <code>timeout</code> (memoria del servidor; el log del robot de arriba persiste en este navegador).
+              · <code>trail</code> · <code>cross</code> · <code>broker</code> · <code>timeout</code> (memoria del servidor; el log del robot de arriba persiste en este navegador).
             </p>
           </div>
         </div>

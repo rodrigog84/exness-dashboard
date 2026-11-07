@@ -5,6 +5,7 @@ import {
   updateStrategy,
   type EntryMode,
 } from "@/lib/strategy";
+import type { TrendParams } from "@/lib/trend/params";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -17,7 +18,7 @@ export async function GET(req: NextRequest) {
 /**
  * Start / stop robot and update params.
  * Body: { running?, instrument?, volume?, side?, entryMode?, holdTicks?,
- *         slPct?, slUsd?, tpPct?, tpUsd? }
+ *         slPct?, slUsd?, tpPct?, tpUsd?, trend?: Partial<TrendParams> }
  * Env defaults apply when fields are omitted (see .env.example).
  */
 export async function POST(req: NextRequest) {
@@ -33,6 +34,7 @@ export async function POST(req: NextRequest) {
     slUsd?: number;
     tpPct?: number;
     tpUsd?: number;
+    trend?: Partial<TrendParams>;
   };
   const strategy = updateStrategy(body);
   return NextResponse.json({ strategy });

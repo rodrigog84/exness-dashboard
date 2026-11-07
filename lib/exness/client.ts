@@ -182,6 +182,36 @@ export class ExnessTraderClient {
     );
   }
 
+  /**
+   * GET /v1/market-data/accounts/{id}/candles (H1/H4/M1…, bid/ask/both).
+   * Use `from` + (`to` | `count`). Top-level arrays come back as `{ items }`.
+   */
+  async getCandles(opts: {
+    instrument?: string;
+    timeframe: string;
+    priceType?: "bid" | "ask" | "both";
+    from: string;
+    to?: string;
+    count?: number;
+  }): Promise<Json> {
+    const id = this.settings.accountId;
+    const q = new URLSearchParams();
+    q.set(
+      "instrument",
+      (opts.instrument || this.settings.instrument).toUpperCase(),
+    );
+    q.set("timeframe", opts.timeframe);
+    q.set("price_type", opts.priceType ?? "both");
+    q.set("from", opts.from);
+    if (opts.to != null) q.set("to", opts.to);
+    if (opts.count != null) q.set("count", String(opts.count));
+    return this.apJson(
+      "GET",
+      `/v1/market-data/accounts/${id}/candles?${q.toString()}`,
+      { allowArray: true },
+    );
+  }
+
   async getOperation(operationId: string): Promise<Json> {
     const id = this.settings.accountId;
     return this.apJson(
@@ -319,6 +349,7 @@ export class ExnessTraderClient {
       jsonBody?: Json;
       idempotencyKey?: string;
       expectedStatuses?: number[];
+      allowArray?: boolean;
     },
   ): Promise<Json> {
     return this.requestJson({
@@ -328,6 +359,7 @@ export class ExnessTraderClient {
       jsonBody: opts?.jsonBody,
       idempotencyKey: opts?.idempotencyKey,
       expectedStatuses: opts?.expectedStatuses,
+      allowArray: opts?.allowArray,
     });
   }
 
@@ -338,6 +370,7 @@ export class ExnessTraderClient {
     jsonBody?: Json;
     idempotencyKey?: string;
     expectedStatuses?: number[];
+    allowArray?: boolean;
   }): Promise<Json> {
     if (!opts.pathWithQuery.startsWith("/")) {
       throw new ExnessConfigError("pathWithQuery must start with '/'");
@@ -396,6 +429,7 @@ export class ExnessTraderClient {
     }
 
     if (!text) return {};
+    if (opts.allowArray && Array.isArray(parsed)) return { items: parsed };
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       throw new ExnessApiError("Expected JSON object response", {
         statusCode: response.status,

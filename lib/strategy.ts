@@ -3,8 +3,13 @@
  *
  * Forever loops cannot run on Vercel. Instead:
  * - UI keeps POSTing /api/strategy/tick while running (Hobby has no minute cron)
- * - Each tick: if flat → open market (alternate / random / fixed side);
- *   if in a managed position → close on SL, optional TP, or max-hold timeout.
+ * - entryMode "trend" (default): trend-following on closed 1h/4h candles, see
+ *   lib/trend/runner.ts (EMA cross + EMA trend filter, ATR stop, R-based TP /
+ *   trailing, risk-based sizing, daily-loss / cooldown / spread brakes).
+ * - Legacy modes (alternate / random / fixed): if flat → open market; if in a
+ *   managed position → close on SL, optional TP, or max-hold timeout.
+ * - tickStrategy(client, settings, state) is a pure state-in/state-out step with
+ *   no browser dependency: a future cron / worker only has to persist `state`.
  *
  * The client is the source of truth: it persists the robot state in
  * localStorage and sends the full state with every tick (hydrateStrategy), so
@@ -19,9 +24,19 @@ import {
   type Settings,
 } from "@/lib/exness";
 import { pushMovement } from "@/lib/movements";
+import {
+  DEFAULT_TREND,
+  defaultRuntime,
+  sanitizeRuntime,
+  sanitizeTrendParams,
+  type CloseReason,
+  type TrendParams,
+  type TrendRuntime,
+} from "@/lib/trend/params";
+import { tickTrend, type TickLog, type TrendTickDeps } from "@/lib/trend/runner";
 
-export type EntryMode = "alternate" | "random" | "fixed";
-export type CloseReason = "sl" | "tp" | "timeout";
+export type { CloseReason } from "@/lib/trend/params";
+export type EntryMode = "trend" | "alternate" | "random" | "fixed";
 export type RobotStatus = "flat" | "in_position" | "opening" | "closing";
 
 export type StrategyConfig = {
@@ -41,6 +56,10 @@ export type StrategyConfig = {
   tpPct: number;
   /** Optional fixed $ unrealized profit that triggers TP. 0 = disabled. */
   tpUsd: number;
+  /** Trend-following parameters (entryMode "trend"). */
+  trend: TrendParams;
+  /** Trend-following runtime state (indicators, brakes, position plan). */
+  trendRuntime: TrendRuntime;
   ticksSinceOpen: number;
   managedPositionId: string | null;
   managedSide: "buy" | "sell" | null;
@@ -67,9 +86,29 @@ function envNum(name: string, fallback: number): number {
 }
 
 function envEntryMode(): EntryMode {
-  const raw = (process.env.EXNESS_ENTRY_MODE || "alternate").toLowerCase();
-  if (raw === "random" || raw === "fixed" || raw === "alternate") return raw;
-  return "alternate";
+  const raw = (process.env.EXNESS_ENTRY_MODE || "trend").toLowerCase();
+  if (
+    raw === "random" ||
+    raw === "fixed" ||
+    raw === "alternate" ||
+    raw === "trend"
+  ) {
+    return raw;
+  }
+  return "trend";
+}
+
+function envTrendParams(): TrendParams {
+  return sanitizeTrendParams({
+    timeframeHours: envNum("TREND_TIMEFRAME_HOURS", DEFAULT_TREND.timeframeHours),
+    riskPct: envNum("TREND_RISK_PCT", DEFAULT_TREND.riskPct),
+    maxVolume: envNum("TREND_MAX_VOLUME", DEFAULT_TREND.maxVolume),
+    maxSpreadPct: envNum("TREND_MAX_SPREAD_PCT", DEFAULT_TREND.maxSpreadPct),
+    cooldownCandles: envNum("TREND_COOLDOWN_CANDLES", DEFAULT_TREND.cooldownCandles),
+    dailyLossPct: envNum("TREND_DAILY_LOSS_PCT", DEFAULT_TREND.dailyLossPct),
+    tpR: envNum("TREND_TP_R", DEFAULT_TREND.tpR),
+    candleSource: process.env.TREND_CANDLE_SOURCE,
+  });
 }
 
 function defaultState(): StrategyConfig {
@@ -86,6 +125,8 @@ function defaultState(): StrategyConfig {
     slUsd: Math.max(0, envNum("EXNESS_SL_USD", 0)),
     tpPct: Math.max(0, envNum("EXNESS_TP_PCT", 0)),
     tpUsd: Math.max(0, envNum("EXNESS_TP_USD", 0)),
+    trend: envTrendParams(),
+    trendRuntime: defaultRuntime(),
     ticksSinceOpen: 0,
     managedPositionId: null,
     managedSide: null,
@@ -106,7 +147,11 @@ function store(): Store {
 }
 
 export function getStrategyState(): StrategyConfig {
-  return { ...store().state };
+  return structuredClone(store().state);
+}
+
+function snapshotState(s: StrategyConfig): StrategyConfig {
+  return structuredClone(s);
 }
 
 export type StrategyPatch = Partial<
@@ -123,7 +168,7 @@ export type StrategyPatch = Partial<
     | "tpPct"
     | "tpUsd"
   >
->;
+> & { trend?: Partial<TrendParams> };
 
 function clampPct(n: number): number {
   if (!Number.isFinite(n) || n < 0) return 0;
@@ -157,6 +202,7 @@ export function hydrateStrategy(input: unknown): StrategyConfig {
   }
   const i = input as Record<string, unknown>;
   const mode = String(i.entryMode ?? "").toLowerCase();
+  const hasTrend = i.trend != null && typeof i.trend === "object";
   const status = String(i.status ?? "");
   const closeReason = String(i.lastCloseReason ?? "");
   const managedSide = String(i.managedSide ?? "");
@@ -168,7 +214,7 @@ export function hydrateStrategy(input: unknown): StrategyConfig {
     volume: strOrNull(i.volume) ?? base.volume,
     side: side === "sell" ? "sell" : side === "buy" ? "buy" : base.side,
     entryMode:
-      mode === "random" || mode === "fixed" || mode === "alternate"
+      mode === "random" || mode === "fixed" || mode === "alternate" || mode === "trend"
         ? mode
         : base.entryMode,
     holdTicks:
@@ -179,6 +225,10 @@ export function hydrateStrategy(input: unknown): StrategyConfig {
     slUsd: numOrNull(i.slUsd) != null ? clampUsd(Number(i.slUsd)) : base.slUsd,
     tpPct: numOrNull(i.tpPct) != null ? clampPct(Number(i.tpPct)) : base.tpPct,
     tpUsd: numOrNull(i.tpUsd) != null ? clampUsd(Number(i.tpUsd)) : base.tpUsd,
+    trend: hasTrend
+      ? sanitizeTrendParams(i.trend, base.trend)
+      : base.trend,
+    trendRuntime: sanitizeRuntime(i.trendRuntime),
     ticksSinceOpen: Math.max(0, Math.floor(numOrNull(i.ticksSinceOpen) ?? 0)),
     managedPositionId: strOrNull(i.managedPositionId),
     managedSide:
@@ -187,10 +237,11 @@ export function hydrateStrategy(input: unknown): StrategyConfig {
     lastTickAt: strOrNull(i.lastTickAt),
     lastError: strOrNull(i.lastError),
     lastAction: strOrNull(i.lastAction),
-    lastCloseReason:
-      closeReason === "sl" || closeReason === "tp" || closeReason === "timeout"
-        ? closeReason
-        : null,
+    lastCloseReason: (
+      ["sl", "tp", "timeout", "trail", "cross", "broker"] as const
+    ).includes(closeReason as CloseReason)
+      ? (closeReason as CloseReason)
+      : null,
     status:
       status === "in_position" ||
       status === "opening" ||
@@ -205,6 +256,7 @@ export function hydrateStrategy(input: unknown): StrategyConfig {
   };
   if (!s.managedPositionId) {
     s.status = "flat";
+    s.trendRuntime.pos = null;
   } else {
     s.status = "in_position";
   }
@@ -220,10 +272,11 @@ export function updateStrategy(patch: StrategyPatch): StrategyConfig {
   if (patch.side != null) s.side = patch.side;
   if (patch.entryMode != null) {
     const m = String(patch.entryMode).toLowerCase();
-    if (m === "alternate" || m === "random" || m === "fixed") {
+    if (m === "alternate" || m === "random" || m === "fixed" || m === "trend") {
       s.entryMode = m;
     }
   }
+  if (patch.trend) s.trend = sanitizeTrendParams(patch.trend, s.trend);
   if (patch.holdTicks != null)
     s.holdTicks = Math.max(1, Math.min(120, Number(patch.holdTicks) || 10));
   if (patch.slPct != null) s.slPct = clampPct(Number(patch.slPct));
@@ -250,7 +303,7 @@ export function updateStrategy(patch: StrategyPatch): StrategyConfig {
         instrument: s.instrument,
         volume: s.volume,
         side: s.side,
-        message: `Robot iniciado (${s.instrument} ${s.volume}, SL ${s.slPct}%${s.slUsd ? ` / $${s.slUsd}` : ""}${s.tpPct || s.tpUsd ? `, TP ${s.tpPct || 0}%${s.tpUsd ? ` / $${s.tpUsd}` : ""}` : ""}, hold≤${s.holdTicks}, entry=${s.entryMode})`,
+        message: `Robot iniciado (${s.instrument} ${s.volume}, SL ${s.slPct}%${s.slUsd ? ` / $${s.slUsd}` : ""}${s.tpPct || s.tpUsd ? `, TP ${s.tpPct || 0}%${s.tpUsd ? ` / $${s.tpUsd}` : ""}` : ""}, hold≤${s.holdTicks}, entry=${s.entryMode}${s.entryMode === "trend" ? `, ${s.trend.timeframeHours}h EMA${s.trend.emaFast}/${s.trend.emaSlow}/${s.trend.emaTrend} risk ${s.trend.riskPct}%` : ""})`,
         meta: {
           action: "start",
           slPct: s.slPct,
@@ -272,6 +325,8 @@ export type TickResult = {
   detail?: string;
   reason?: CloseReason;
   retryAfterSec?: number;
+  /** Robot log lines for this tick (trend mode); the UI persists them. */
+  logs?: TickLog[];
 };
 
 function numField(obj: Record<string, unknown>, keys: string[]): number | null {
@@ -355,7 +410,7 @@ async function closeManaged(
   }
 
   const reasonLabel =
-    reason === "sl" ? "stop loss" : reason === "tp" ? "take profit" : "timeout";
+    reason === "sl" ? "stop loss" : reason === "tp" ? "take profit" : reason;
   pushMovement({
     kind: "close",
     instrument: s.instrument,
@@ -390,11 +445,27 @@ async function closeManaged(
   };
 }
 
+/** One step on the in-memory state (UI hydrates it before each tick). */
 export async function runStrategyTick(
   client: ExnessTraderClient,
   settings: Settings,
+  deps?: TrendTickDeps,
 ): Promise<TickResult> {
-  const s = store().state;
+  return tickStrategy(client, settings, store().state, deps);
+}
+
+/**
+ * One robot step over an explicit state object (mutated in place; the result
+ * carries a snapshot). No browser dependency: callable from a cron / worker
+ * that persists `state` between invocations.
+ */
+export async function tickStrategy(
+  client: ExnessTraderClient,
+  settings: Settings,
+  s: StrategyConfig,
+  deps?: TrendTickDeps,
+): Promise<TickResult> {
+  const getStrategyState = () => snapshotState(s);
   s.lastTickAt = new Date().toISOString();
   s.tickCount += 1;
 
@@ -403,6 +474,24 @@ export async function runStrategyTick(
   }
 
   try {
+    if (s.entryMode === "trend") {
+      const r = await tickTrend(client, settings, s, deps);
+      if (r.action === "error") {
+        pushMovement({
+          kind: "error",
+          instrument: s.instrument,
+          message: `Tick error: ${r.detail ?? "?"}`,
+        });
+      }
+      return {
+        state: getStrategyState(),
+        action: r.action,
+        detail: r.detail,
+        reason: r.reason,
+        logs: r.logs,
+      };
+    }
+
     const snapshot = await client.getSnapshot();
     const positions = client.extractPositions(snapshot);
 

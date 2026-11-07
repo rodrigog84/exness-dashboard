@@ -7,7 +7,10 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "verify:signing": "tsx scripts/verify-signing.ts"
+    "verify:signing": "tsx scripts/verify-signing.ts",
+    "backtest": "tsx scripts/backtest.ts",
+    "simulate:tick": "tsx scripts/simulate-tick.ts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "next": "^15.1.0",
