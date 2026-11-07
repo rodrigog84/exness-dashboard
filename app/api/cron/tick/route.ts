@@ -8,7 +8,7 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
 /**
- * Vercel Cron entry (see vercel.json — every minute).
+ * Optional Vercel Cron entry (disabled on Hobby; re-enable minute cron on Pro).
  * Auth: Authorization: Bearer $CRON_SECRET (set automatically on Vercel).
  * No-ops when strategy is stopped.
  */

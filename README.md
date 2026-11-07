@@ -46,7 +46,7 @@ En Vercel **no** hay un proceso forever. El bucle es:
 
 1. UI pone `running=true` vía `POST /api/strategy`.
 2. El cliente hace poll a `POST /api/strategy/tick` cada ~35s mientras está running.
-3. Opcional: **Vercel Cron** (`vercel.json`) llama `GET /api/cron/tick` cada minuto (auth `CRON_SECRET`).
+3. En **Hobby**, el bucle depende solo de esos ticks de UI (Vercel Hobby no permite cron cada minuto). En **Pro**, puedes reactivar cron minuto en `vercel.json` hacia `GET /api/cron/tick` (auth `CRON_SECRET`).
 4. Cada tick: si no hay posición gestionada → open mercado mínimo; si ya hay y `ticksSinceOpen ≥ holdTicks` (default 3) → close.
 
 Estado de estrategia y log de movimientos: **in-memory** por isolate. Un cold start reinicia `running=false` y vacía el log. Para producción seria: KV / DB.
@@ -96,7 +96,13 @@ O arrastra la carpeta en [vercel.com/new](https://vercel.com/new) si tu plan lo 
 
 ### Cron
 
-`vercel.json` ya declara cron cada minuto a `/api/cron/tick`. En Hobby el mínimo puede ser 1×/día según plan; el poll de la UI cubre el bucle mientras el panel está abierto.
+En Hobby no hay cron configurado: el poll de la UI (~35s) cubre el bucle mientras el panel está abierto. En Pro puedes reactivar un cron cada minuto en `vercel.json`:
+
+```json
+{
+  "crons": [{ "path": "/api/cron/tick", "schedule": "*/1 * * * *" }]
+}
+```
 
 ## Seguridad
 
@@ -113,6 +119,6 @@ components/          Dashboard UI (ES)
 lib/exness/          Cliente + firma (port del bot Python)
 lib/strategy.ts      Estado + tick placeholder
 lib/auth.ts          Cookie / secret gate
-vercel.json          Cron
+vercel.json          (vacío en Hobby; Pro puede reactivar cron)
 scripts/verify-signing.ts
 ```
